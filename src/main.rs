@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -25,6 +25,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 static SPAN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -38,6 +41,7 @@ struct Inner {
     otlp_endpoint: String,
     spool_dir: PathBuf,
     otlp_headers_configured: bool,
+    recent_events: Mutex<HashMap<String, u64>>,
     dropped_total: AtomicU64,
 }
 
@@ -49,6 +53,8 @@ struct SessionState {
     turn_start_ns: Option<u64>,
     pairs: HashMap<String, StartState>,
     messages: HashMap<String, MessageStream>,
+    turn_prompt: Option<String>,
+    usage_offset: u64,
     start_ns: u64,
     last_seen_ns: u64,
     turn_count: u64,
@@ -94,8 +100,10 @@ struct EventOutput {
 
 struct TurnUsageJob {
     span: SpanDraft,
+    session_id: String,
     transcript_path: Option<String>,
     prompt_id: Option<String>,
+    start_offset: u64,
 }
 
 struct SummaryJob {
@@ -170,18 +178,30 @@ fn bool_field(payload: &Value, key: &str) -> Option<bool> {
     payload.get(key).and_then(Value::as_bool)
 }
 
+fn set_attr(attributes: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some(existing) = attributes.iter_mut().find(|(known, _)| known == key) {
+        existing.1 = value;
+    } else {
+        attributes.push((key.to_string(), value));
+    }
+}
+
 fn add_scalar(attributes: &mut Vec<(String, String)>, payload: &Value, key: &str, attr: &str) {
     if let Some(value) = scalar_field(payload, key) {
         attributes.push((attr.to_string(), value));
     }
 }
 
-fn base_attributes(payload: &Value, event: &str, session_id: &str) -> Vec<(String, String)> {
-    let raw = payload.to_string();
+fn base_attributes(
+    payload: &Value,
+    raw: &str,
+    event: &str,
+    session_id: &str,
+) -> Vec<(String, String)> {
     let mut attributes = vec![
         ("claude.hook.event".to_string(), event.to_string()),
         ("claude.session_id".to_string(), session_id.to_string()),
-        ("claude.hook.payload".to_string(), raw.clone()),
+        ("claude.hook.payload".to_string(), raw.to_string()),
         (
             "claude.hook.payload_bytes".to_string(),
             raw.len().to_string(),
@@ -215,6 +235,56 @@ fn base_attributes(payload: &Value, event: &str, session_id: &str) -> Vec<(Strin
 
     if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
         attributes.push(("claude.prompt_length".to_string(), prompt.len().to_string()));
+        set_attr(
+            &mut attributes,
+            "langfuse.observation.input",
+            json!({ "prompt": prompt }).to_string(),
+        );
+    }
+
+    if let Some(expanded) = payload.get("expanded_prompt").and_then(Value::as_str) {
+        set_attr(
+            &mut attributes,
+            "langfuse.observation.input",
+            json!({ "prompt": expanded }).to_string(),
+        );
+    }
+
+    if let Some(tool_input) = payload.get("tool_input") {
+        set_attr(
+            &mut attributes,
+            "langfuse.observation.input",
+            json!({ "tool_input": tool_input }).to_string(),
+        );
+    }
+
+    for output_key in ["tool_response", "tool_output"] {
+        if let Some(output) = payload.get(output_key) {
+            set_attr(
+                &mut attributes,
+                "langfuse.observation.output",
+                json!({ "tool_output": output }).to_string(),
+            );
+        }
+    }
+
+    if let Some(last_message) = payload
+        .get("last_assistant_message")
+        .and_then(Value::as_str)
+    {
+        set_attr(
+            &mut attributes,
+            "langfuse.observation.output",
+            json!({ "text": last_message }).to_string(),
+        );
+    }
+
+    if let Some(error) = payload.get("error").and_then(Value::as_str) {
+        set_attr(
+            &mut attributes,
+            "langfuse.observation.output",
+            json!({ "error": error }).to_string(),
+        );
     }
 
     // OTel GenAI semantic conventions, in addition to the raw Claude attributes.
@@ -333,6 +403,12 @@ fn build_message_span(
             })
         })
         .collect();
+    let full_text: String = chunks.iter().map(|chunk| chunk.delta.as_str()).collect();
+    set_attr(
+        &mut attributes,
+        "langfuse.observation.output",
+        json!({ "text": full_text }).to_string(),
+    );
 
     attributes.push(("claude.message.id".to_string(), message_id.to_string()));
     attributes.push((
@@ -454,6 +530,48 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
     let mut spans = Vec::new();
     let mut summary = None;
     let mut turn_usage = None;
+    let raw_payload = payload.to_string();
+    let event_key = hex_id(&format!("{event}:{raw_payload}"), 16);
+    let base_attrs = base_attributes(payload, &raw_payload, &event, &session_id);
+
+    {
+        let mut recent = state
+            .inner
+            .recent_events
+            .lock()
+            .expect("recent events lock");
+        let cutoff = now.saturating_sub(300 * 1_000_000_000);
+        recent.retain(|_, timestamp| *timestamp >= cutoff);
+        if recent.contains_key(&event_key) {
+            tracing::info!(
+                session_id = %session_id,
+                event = %event,
+                "duplicate hook event ignored"
+            );
+            return EventOutput {
+                spans: Vec::new(),
+                summary: None,
+                turn_usage: None,
+            };
+        }
+        recent.insert(event_key, now);
+    }
+
+    if event == "SessionEnd"
+        && !state
+            .inner
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .contains_key(&session_id)
+    {
+        tracing::info!(session_id = %session_id, "ignoring SessionEnd without an active session");
+        return EventOutput {
+            spans: Vec::new(),
+            summary: None,
+            turn_usage: None,
+        };
+    }
 
     let mut sessions = state.inner.sessions.lock().expect("sessions lock");
     let existed = sessions.contains_key(&session_id);
@@ -462,11 +580,13 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
         .or_insert_with(|| SessionState {
             session_id: session_id.clone(),
             trace_id: hex_id(&format!("trace:{session_id}"), 16),
-            root_id: hex_id(&format!("session:{session_id}"), 8),
+            root_id: unique_span_id("session"),
             turn_id: None,
             turn_start_ns: None,
             pairs: HashMap::new(),
             messages: HashMap::new(),
+            turn_prompt: None,
+            usage_offset: 0,
             start_ns: now,
             last_seen_ns: now,
             turn_count: 0,
@@ -490,7 +610,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
             name: "session".to_string(),
             start_ns: now,
             end_ns: now + 1_000_000,
-            attributes: base_attributes(payload, &event, &session_id),
+            attributes: base_attrs.clone(),
             error: false,
         });
     }
@@ -503,7 +623,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 "session.resume",
                 now,
                 now,
-                base_attributes(payload, &event, &session_id),
+                base_attrs.clone(),
                 false,
             ));
         }
@@ -518,13 +638,17 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
         .turn_id
         .clone()
         .unwrap_or_else(|| session.root_id.clone());
-    let attrs = base_attributes(payload, &event, &session_id);
+    let attrs = base_attrs;
 
     match event.as_str() {
         "UserPromptSubmit" => {
             session.turn_count += 1;
+            session.turn_prompt = payload
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
             let turn_id = string_field(payload, "prompt_id")
-                .map(|prompt_id| hex_id(&format!("turn:{prompt_id}"), 8))
+                .map(|prompt_id| hex_id(&format!("turn:{}:{prompt_id}", session.root_id), 8))
                 .unwrap_or_else(|| unique_span_id("turn"));
             session.turn_id = Some(turn_id.clone());
             session.turn_start_ns = Some(now);
@@ -550,8 +674,17 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 .clone()
                 .unwrap_or_else(|| unique_span_id("turn"));
             let start_ns = session.turn_start_ns.unwrap_or(now);
+            let turn_prompt = session.turn_prompt.take();
             session.turn_id = None;
             session.turn_start_ns = None;
+            let mut turn_attrs = attrs;
+            if let Some(prompt) = turn_prompt {
+                set_attr(
+                    &mut turn_attrs,
+                    "langfuse.observation.input",
+                    json!({ "prompt": prompt }).to_string(),
+                );
+            }
             let turn_span = SpanDraft {
                 trace_id: session.trace_id.clone(),
                 span_id: turn_id,
@@ -559,16 +692,24 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 name: "agent.turn".to_string(),
                 start_ns,
                 end_ns: now,
-                attributes: attrs,
+                attributes: turn_attrs,
                 error: event == "StopFailure",
             };
             let transcript_path = string_field(payload, "transcript_path");
             let prompt_id = string_field(payload, "prompt_id");
+            let start_offset = session.usage_offset;
+            if let Some(path) = &transcript_path {
+                if let Ok(metadata) = std::fs::metadata(path) {
+                    session.usage_offset = session.usage_offset.max(metadata.len());
+                }
+            }
             if transcript_path.is_some() && prompt_id.is_some() {
                 turn_usage = Some(TurnUsageJob {
                     span: turn_span,
+                    session_id: session.session_id.clone(),
                     transcript_path,
                     prompt_id,
+                    start_offset,
                 });
             } else {
                 spans.push(turn_span);
@@ -583,7 +724,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
             let tool_name =
                 string_field(payload, "tool_name").unwrap_or_else(|| "tool".to_string());
             let pair_key = format!("tool:{key}");
-            let span_id = hex_id(&format!("tool:{session_id}:{key}:start"), 8);
+            let span_id = hex_id(&format!("tool:{}:{key}:start", session.root_id), 8);
             session.pairs.insert(
                 pair_key,
                 StartState {
@@ -618,7 +759,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
             }
             spans.push(SpanDraft {
                 trace_id: session.trace_id.clone(),
-                span_id: hex_id(&format!("tool:{session_id}:{key}:result"), 8),
+                span_id: hex_id(&format!("tool:{}:{key}:result", session.root_id), 8),
                 parent_id: Some(parent.clone()),
                 name: format!("tool.{tool_name}.result"),
                 start_ns,
@@ -636,7 +777,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
             let agent_type =
                 string_field(payload, "agent_type").unwrap_or_else(|| "subagent".to_string());
             let pair_key = format!("subagent:{key}");
-            let span_id = hex_id(&format!("subagent:{session_id}:{key}:start"), 8);
+            let span_id = hex_id(&format!("subagent:{}:{key}:start", session.root_id), 8);
             session.pairs.insert(
                 pair_key,
                 StartState {
@@ -671,7 +812,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
             }
             spans.push(SpanDraft {
                 trace_id: session.trace_id.clone(),
-                span_id: hex_id(&format!("subagent:{session_id}:{key}:stop"), 8),
+                span_id: hex_id(&format!("subagent:{}:{key}:stop", session.root_id), 8),
                 parent_id: Some(parent.clone()),
                 name: format!("subagent.{agent_type}.stop"),
                 start_ns,
@@ -683,7 +824,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
 
         "PreCompact" | "PostCompact" => {
             if event == "PreCompact" {
-                let span_id = hex_id(&format!("compact:{session_id}:pre"), 8);
+                let span_id = hex_id(&format!("compact:{}:pre", session.root_id), 8);
                 session.pairs.insert(
                     "compact".to_string(),
                     StartState {
@@ -710,7 +851,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 }
                 spans.push(SpanDraft {
                     trace_id: session.trace_id.clone(),
-                    span_id: hex_id(&format!("compact:{session_id}:post"), 8),
+                    span_id: hex_id(&format!("compact:{}:post", session.root_id), 8),
                     parent_id: Some(parent.clone()),
                     name: "context.compact.result".to_string(),
                     start_ns,
@@ -723,7 +864,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
 
         "PreModelSwitch" | "PostModelSwitch" => {
             if event == "PreModelSwitch" {
-                let span_id = hex_id(&format!("model:{session_id}:pre"), 8);
+                let span_id = hex_id(&format!("model:{}:pre", session.root_id), 8);
                 session.pairs.insert(
                     "model".to_string(),
                     StartState {
@@ -750,7 +891,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 }
                 spans.push(SpanDraft {
                     trace_id: session.trace_id.clone(),
-                    span_id: hex_id(&format!("model:{session_id}:post"), 8),
+                    span_id: hex_id(&format!("model:{}:post", session.root_id), 8),
                     parent_id: Some(parent.clone()),
                     name: "model.switch.result".to_string(),
                     start_ns,
@@ -767,7 +908,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 .unwrap_or_else(|| "task".to_string());
             let pair_key = format!("task:{key}");
             if event == "TaskCreated" {
-                let span_id = hex_id(&format!("task:{session_id}:{key}:created"), 8);
+                let span_id = hex_id(&format!("task:{}:{key}:created", session.root_id), 8);
                 session.pairs.insert(
                     pair_key,
                     StartState {
@@ -794,7 +935,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 }
                 spans.push(SpanDraft {
                     trace_id: session.trace_id.clone(),
-                    span_id: hex_id(&format!("task:{session_id}:{key}:completed"), 8),
+                    span_id: hex_id(&format!("task:{}:{key}:completed", session.root_id), 8),
                     parent_id: Some(parent.clone()),
                     name: "task.result".to_string(),
                     start_ns,
@@ -811,7 +952,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 .unwrap_or_else(|| "elicitation".to_string());
             let pair_key = format!("elicitation:{key}");
             if event == "Elicitation" {
-                let span_id = hex_id(&format!("elicitation:{session_id}:{key}:start"), 8);
+                let span_id = hex_id(&format!("elicitation:{}:{key}:start", session.root_id), 8);
                 session.pairs.insert(
                     pair_key,
                     StartState {
@@ -838,7 +979,7 @@ fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 }
                 spans.push(SpanDraft {
                     trace_id: session.trace_id.clone(),
-                    span_id: hex_id(&format!("elicitation:{session_id}:{key}:result"), 8),
+                    span_id: hex_id(&format!("elicitation:{}:{key}:result", session.root_id), 8),
                     parent_id: Some(parent.clone()),
                     name: "mcp.elicitation.result".to_string(),
                     start_ns,
@@ -1139,8 +1280,21 @@ async fn export_batch(
     Ok(())
 }
 
+async fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    Ok(())
+}
+
+async fn secure_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    Ok(())
+}
+
 async fn spool_batch(spool_dir: &Path, body: &Value) -> Result<(), String> {
-    tokio::fs::create_dir_all(spool_dir)
+    ensure_private_dir(spool_dir)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -1150,6 +1304,9 @@ async fn spool_batch(spool_dir: &Path, body: &Value) -> Result<(), String> {
     let tmp_path = spool_dir.join(format!(".{name}.tmp"));
 
     tokio::fs::write(&tmp_path, body.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+    secure_file(&tmp_path)
         .await
         .map_err(|error| error.to_string())?;
     if let Err(error) = tokio::fs::rename(&tmp_path, &path).await {
@@ -1408,18 +1565,42 @@ fn walk_usage(value: &Value, usage: &mut UsageStats) {
     }
 }
 
-fn parse_turn_usage(path: &str, prompt_id: &str) -> UsageStats {
+fn parse_turn_usage(path: &str, prompt_id: &str, start_offset: u64) -> (UsageStats, u64) {
     let mut usage = UsageStats::default();
     let Ok(file) = File::open(path) else {
-        return usage;
+        return (usage, start_offset);
     };
+    let mut reader = BufReader::new(file);
+    if reader.seek(SeekFrom::Start(start_offset)).is_err() {
+        return (usage, start_offset);
+    }
 
     let mut active = false;
     let mut saw_prompt = false;
     let mut seen_message_ids = HashSet::new();
+    let mut line = String::new();
+    let mut end_offset = start_offset;
 
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    loop {
+        let before = match reader.stream_position() {
+            Ok(position) => position,
+            Err(_) => break,
+        };
+        line.clear();
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(bytes_read) => bytes_read,
+            Err(_) => break,
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        let after = reader
+            .stream_position()
+            .unwrap_or(before + bytes_read as u64);
+
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            end_offset = after;
             continue;
         };
         let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
@@ -1430,23 +1611,29 @@ fn parse_turn_usage(path: &str, prompt_id: &str) -> UsageStats {
 
         if line_type == "user" {
             if let Some(line_prompt) = line_prompt {
-                active = line_prompt == prompt_id;
-                if active {
+                if active && line_prompt != prompt_id {
+                    end_offset = before;
+                    break;
+                }
+                if line_prompt == prompt_id {
+                    active = true;
                     saw_prompt = true;
                 }
             }
+            end_offset = after;
             continue;
         }
 
         if active && line_type == "assistant" {
             add_assistant_usage(&value, &mut usage, &mut seen_message_ids);
         }
+        end_offset = after;
     }
 
     if !saw_prompt {
-        UsageStats::default()
+        (UsageStats::default(), start_offset)
     } else {
-        usage
+        (usage, end_offset)
     }
 }
 
@@ -1561,24 +1748,36 @@ async fn run_turn_usage(state: Arc<AppState>, job: TurnUsageJob) {
     let path = job.transcript_path.clone();
     let prompt_id = job.prompt_id.clone();
     let mut usage = UsageStats::default();
+    let mut new_offset = job.start_offset;
 
     // Stop can fire before Claude has flushed assistant usage into the transcript.
+    // Only scan the new transcript range for this session, not the whole file again.
     for attempt in 0..6 {
         let path = path.clone();
         let prompt_id = prompt_id.clone();
-        usage =
+        let start_offset = job.start_offset;
+        let (parsed, offset) =
             tokio::task::spawn_blocking(move || match (path.as_deref(), prompt_id.as_deref()) {
-                (Some(path), Some(prompt_id)) => parse_turn_usage(path, prompt_id),
-                _ => UsageStats::default(),
+                (Some(path), Some(prompt_id)) => parse_turn_usage(path, prompt_id, start_offset),
+                _ => (UsageStats::default(), start_offset),
             })
             .await
             .unwrap_or_default();
 
+        usage = parsed;
+        new_offset = offset;
         if usage.input_tokens > 0 || usage.output_tokens > 0 {
             break;
         }
         if attempt < 5 {
             tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    {
+        let mut sessions = state.inner.sessions.lock().expect("sessions lock");
+        if let Some(session) = sessions.get_mut(&job.session_id) {
+            session.usage_offset = session.usage_offset.max(new_offset);
         }
     }
 
@@ -1869,7 +2068,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30);
 
-    tokio::fs::create_dir_all(&spool_dir).await?;
+    ensure_private_dir(&spool_dir).await?;
 
     let (tx, rx) = mpsc::channel(queue_capacity);
     let client = reqwest::Client::builder()
@@ -1882,6 +2081,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             otlp_endpoint: otlp_endpoint.clone(),
             spool_dir: spool_dir.clone(),
             otlp_headers_configured,
+            recent_events: Mutex::new(HashMap::new()),
             dropped_total: AtomicU64::new(0),
         }),
     });

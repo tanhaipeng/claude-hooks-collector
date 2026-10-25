@@ -21,6 +21,9 @@
 - 32MB 请求体上限，适配大工具输出
 - **P0 可靠性**：SIGINT/SIGTERM 优雅退出、有界队列、批量导出、失败重试、本地 spool 重放、TTL 清理
 - **P1 语义**：GenAI 语义属性、span links、`agent.turn` 每轮 token、`session.summary` 会话汇总、int/bool 属性类型
+- **Langfuse 可读性**：input/output、observation type、model、usage、session id
+- **安全/稳定性**：spool 目录 0700、文件 0600；5 分钟事件幂等；增量 transcript 解析
+- **HTTPS**：reqwest 启用 rustls，可发 Langfuse Cloud 或其他 HTTPS OTLP 后端
 
 ## 架构
 
@@ -91,7 +94,7 @@ curl http://127.0.0.1:4321/health
 | 变量 | 默认值 |
 |---|---|
 | `LISTEN_ADDR` | `127.0.0.1:4321` |
-| `OTLP_ENDPOINT` | `http://127.0.0.1:3000/api/public/otel`（会自动补 `/v1/traces`） |
+| `OTLP_ENDPOINT` | `http://127.0.0.1:3000/api/public/otel`（会自动补 `/v1/traces`，支持 http/https） |
 | `OTLP_HEADERS` | 可选，`key=value,key=value`；Langfuse 需要 Basic Auth 和 `x-langfuse-ingestion-version=4` |
 | `QUEUE_CAPACITY` | `4096`（有界队列；满了丢 span 并计数） |
 | `SPOOL_DIR` | `spool`（导出失败后的落盘目录） |
@@ -154,6 +157,15 @@ python3 simulate.py
 `agent.turn` / `session.summary` 会映射为 Langfuse 的 `GENERATION`，
 `usage_details` 包含 `input` / `output` / `total` / cache token，模型名写入
 `langfuse.observation.model.name`。
+
+同时补充 Langfuse input/output：
+
+- `prompt` → `langfuse.observation.input`
+- `tool.*` → tool_input / tool_output
+- `agent.turn` → 本轮 prompt / last_assistant_message
+- `message.display` → 合并后的流式文本
+
+spool 目录权限为 `0700`，batch 文件为 `0600`。同一个 Hook 事件在 5 分钟内重复提交会被忽略。
 
 切换后端时不做双写：当前 `collector.env` 已切回 Jaeger，新 trace 只发 Jaeger；Langfuse 数据仍保留在其 Docker Volume。
 如果要切换回 Jaeger，修改 `collector.env` 的 `OTLP_ENDPOINT` 并重启 collector。
