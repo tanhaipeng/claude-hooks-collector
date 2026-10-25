@@ -1,7 +1,8 @@
 # Claude Code Hooks -> OTLP Collector (Rust + Axum)
 
 接收 Claude Code 的 **HTTP 类型 Hook**，把每个 Hook 事件转换成 OTel span，
-通过 **OTLP/HTTP** 上报到本地 Jaeger（默认 `http://127.0.0.1:4318/v1/traces`）。
+通过 **OTLP/HTTP** 上报到 Langfuse、Jaeger 或其他兼容后端。
+当前默认配置发送到本地 **Langfuse**（`http://127.0.0.1:3000/api/public/otel/v1/traces`）。
 
 ## 特性
 
@@ -34,12 +35,21 @@ Axum collector :4321
 有界队列（默认 4096）
   │ 批量 64 个 / 250ms
   ▼
-OTLP/HTTP :4318/v1/traces
+OTLP/HTTP → Langfuse :3000/api/public/otel/v1/traces
+  │ Basic Auth + x-langfuse-ingestion-version: 4
   │ 失败重试 3 次
   ├─ 仍失败 → spool/*.json → 定时重放
   ▼
-Jaeger UI :16686
+Langfuse UI :3000
 ```
+
+也可以是 Jaeger：
+
+```text
+OTLP_ENDPOINT=http://127.0.0.1:4318
+```
+
+此时 trace 只发 Jaeger，不并发双写。
 
 ## OTel 资源命名
 
@@ -56,9 +66,9 @@ Jaeger UI :16686
 说明：
 
 - 项目/目录/二进制仍叫 `claude-hooks-collector`
-- Jaeger 里的 **service 名**是 `claude-code-hooks`，表示“Claude Code 的 Hook 遥测”
+- Langfuse 里的 **service 名**是 `claude-code-hooks`，表示“Claude Code 的 Hook 遥测”
 - `service.namespace=claude-code` 保留产品归属
-- 之前已经写入的旧 trace 仍显示在 `claude-code` service 下，新 trace 在 `claude-code-hooks` 下
+- 之前写入 Jaeger 的旧 trace 仍显示在 `claude-code` service 下；新 trace 发往 Langfuse
 
 ## 运行
 
@@ -81,12 +91,68 @@ curl http://127.0.0.1:4321/health
 | 变量 | 默认值 |
 |---|---|
 | `LISTEN_ADDR` | `127.0.0.1:4321` |
-| `OTLP_ENDPOINT` | `http://127.0.0.1:4318`（会自动补 `/v1/traces`） |
+| `OTLP_ENDPOINT` | `http://127.0.0.1:3000/api/public/otel`（会自动补 `/v1/traces`） |
+| `OTLP_HEADERS` | 可选，`key=value,key=value`；Langfuse 需要 Basic Auth 和 `x-langfuse-ingestion-version=4` |
 | `QUEUE_CAPACITY` | `4096`（有界队列；满了丢 span 并计数） |
 | `SPOOL_DIR` | `spool`（导出失败后的落盘目录） |
 | `SESSION_TTL_SECS` | `3600`（0 表示禁用 TTL） |
 | `TTL_SWEEP_SECS` | `60`（TTL 扫描间隔） |
 | `SPOOL_REPLAY_SECS` | `30`（spool 重放间隔） |
+
+## Langfuse 本地部署
+
+本次已安装到：
+
+```text
+/Users/simon/dev/langfuse
+```
+
+运行方式：
+
+```bash
+cd /Users/simon/dev/langfuse
+docker-compose up -d
+docker-compose ps
+```
+
+UI：
+
+```text
+http://localhost:3000
+```
+
+登录账号和初始密码保存在 `langfuse/.env` 的 `LANGFUSE_INIT_USER_*` 变量里。
+Project：`claude-hooks`；Organization：`claude-code`。
+
+后端运行时：
+
+- Docker 使用 Colima；已设置 `brew services start colima` 开机自启
+- Langfuse 容器使用 `restart: always`
+- 停止 Langfuse：`docker-compose down`（数据卷保留）
+
+Collector 使用 `collector.env`（已 gitignore）配置 Langfuse：
+
+```bash
+OTLP_ENDPOINT=http://127.0.0.1:3000/api/public/otel
+OTLP_HEADERS='Authorization=Basic <base64(pk:sk)>,x-langfuse-ingestion-version=4'
+LANGFUSE_HOST=http://127.0.0.1:3000
+LANGFUSE_AUTH=<base64(pk:sk)>
+```
+
+`start.sh` 会自动 source 这个文件。示例见
+[collector.env.example](collector.env.example)。
+
+验证：
+
+```bash
+python3 simulate.py
+```
+
+`simulate.py` 会检测 collector 的 OTLP endpoint；如果指向 Langfuse，
+会查询 `GET /api/public/v2/observations` 并确认 35 个 observation 已到达。
+
+当前不再向 Jaeger 双写：旧 Jaeger trace 保留，新 trace 只发 Langfuse。
+如果要切换回 Jaeger，修改 `collector.env` 的 `OTLP_ENDPOINT` 并重启 collector。
 
 ## 不影响 Claude 流程
 

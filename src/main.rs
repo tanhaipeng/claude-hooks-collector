@@ -17,6 +17,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -36,6 +37,7 @@ struct Inner {
     tx: mpsc::Sender<SpanDraft>,
     otlp_endpoint: String,
     spool_dir: PathBuf,
+    otlp_headers_configured: bool,
     dropped_total: AtomicU64,
 }
 
@@ -256,6 +258,19 @@ fn base_attributes(payload: &Value, event: &str, session_id: &str) -> Vec<(Strin
     if let Some(model) = &model {
         attributes.push(("gen_ai.request.model".to_string(), model.clone()));
     }
+
+    let langfuse_type = match event {
+        "Stop" | "StopFailure" => "generation",
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => "tool",
+        "MessageDisplay" => "event",
+        "SubagentStart" | "SubagentStop" => "agent",
+        _ => "span",
+    };
+    attributes.push((
+        "langfuse.observation.type".to_string(),
+        langfuse_type.to_string(),
+    ));
+    attributes.push(("langfuse.session.id".to_string(), session_id.to_string()));
 
     attributes.push((
         "claude.timing.source".to_string(),
@@ -1507,11 +1522,28 @@ fn build_summary_span(job: &SummaryJob, usage: &UsageStats) -> SpanDraft {
             "claude.timing.source".to_string(),
             "session_summary".to_string(),
         ),
+        (
+            "langfuse.observation.type".to_string(),
+            "generation".to_string(),
+        ),
+        ("langfuse.session.id".to_string(), job.session_id.clone()),
+        (
+            "langfuse.observation.usage_details".to_string(),
+            json!({
+                "input": usage.input_tokens,
+                "output": usage.output_tokens,
+                "total": total_tokens,
+                "cache_read_input_tokens": usage.cache_read_input_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            })
+            .to_string(),
+        ),
     ];
 
     if let Some(model) = &model {
         attributes.push(("claude.model".to_string(), model.clone()));
         attributes.push(("gen_ai.request.model".to_string(), model.clone()));
+        attributes.push(("langfuse.observation.model.name".to_string(), model.clone()));
     }
 
     SpanDraft {
@@ -1581,9 +1613,22 @@ async fn run_turn_usage(state: Arc<AppState>, job: TurnUsageJob) {
         span.attributes
             .push(("claude.usage.prompt_id".to_string(), prompt_id.clone()));
     }
+    span.attributes.push((
+        "langfuse.observation.usage_details".to_string(),
+        json!({
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "total": total_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        })
+        .to_string(),
+    ));
     if let Some(model) = usage.models.first() {
         span.attributes
             .push(("gen_ai.request.model".to_string(), model.clone()));
+        span.attributes
+            .push(("langfuse.observation.model.name".to_string(), model.clone()));
     }
 
     if let Err(error) = state.inner.tx.send(span).await {
@@ -1725,11 +1770,38 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "otel_service_namespace": "claude-code",
         "otlp_endpoint": state.inner.otlp_endpoint,
         "spool_dir": state.inner.spool_dir.display().to_string(),
+        "otlp_headers_configured": state.inner.otlp_headers_configured,
         "sessions": state.inner.sessions.lock().map(|sessions| sessions.len()).unwrap_or(0),
         "queue_capacity": state.inner.tx.max_capacity(),
         "queue_available": state.inner.tx.capacity(),
         "dropped_total": state.inner.dropped_total.load(Ordering::Relaxed),
     }))
+}
+
+fn parse_otlp_headers(value: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = part.split_once('=') else {
+            tracing::warn!("ignoring malformed OTLP_HEADERS entry without '='");
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        match (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            (Ok(name), Ok(value)) => {
+                headers.insert(name, value);
+            }
+            _ => tracing::warn!(header = %name, "ignoring invalid OTLP_HEADERS entry"),
+        }
+    }
+    headers
 }
 
 fn normalize_otlp_endpoint(value: &str) -> String {
@@ -1778,6 +1850,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:4318".to_string()),
     );
     let spool_dir = PathBuf::from(env::var("SPOOL_DIR").unwrap_or_else(|_| "spool".to_string()));
+    let otlp_headers = parse_otlp_headers(&env::var("OTLP_HEADERS").unwrap_or_default());
+    let otlp_headers_configured = !otlp_headers.is_empty();
     let queue_capacity = env::var("QUEUE_CAPACITY")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -1799,13 +1873,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&spool_dir).await?;
 
     let (tx, rx) = mpsc::channel(queue_capacity);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .default_headers(otlp_headers)
+        .build()?;
     let state = Arc::new(AppState {
         inner: Arc::new(Inner {
             sessions: Mutex::new(HashMap::new()),
             tx,
             otlp_endpoint: otlp_endpoint.clone(),
             spool_dir: spool_dir.clone(),
+            otlp_headers_configured,
             dropped_total: AtomicU64::new(0),
         }),
     });

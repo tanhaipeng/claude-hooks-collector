@@ -11,6 +11,21 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+def load_env_file():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "collector.env")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+load_env_file()
+
 COLLECTOR = os.environ.get("COLLECTOR_URL", "http://127.0.0.1:4321/hooks")
 JAEGER = os.environ.get("JAEGER_API", "http://127.0.0.1:16686/api/v3/traces")
 SERVICE = "claude-code-hooks"
@@ -31,6 +46,69 @@ def post(event):
             resp.read()
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"collector returned {exc.code}: {exc.read()[:500]!r}") from exc
+
+
+def detect_backend():
+    configured = os.environ.get("VERIFY_BACKEND", "").strip().lower()
+    if configured:
+        return configured
+    try:
+        health_url = COLLECTOR.rsplit("/hooks", 1)[0] + "/health"
+        with urllib.request.urlopen(health_url, timeout=5) as resp:
+            health = json.load(resp)
+        endpoint = str(health.get("otlp_endpoint", ""))
+        if "langfuse" in endpoint or ":3000" in endpoint:
+            return "langfuse"
+    except Exception:
+        pass
+    return "jaeger"
+
+
+def verify_langfuse(session_id):
+    host = os.environ.get("LANGFUSE_HOST", "http://127.0.0.1:3000").rstrip("/")
+    auth = os.environ.get("LANGFUSE_AUTH", "")
+    if not auth:
+        print("LANGFUSE_AUTH is not set; cannot verify Langfuse")
+        return 1
+
+    url = host + "/api/public/v2/observations?limit=100"
+    for attempt in range(1, 11):
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Basic {auth}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+        except Exception as exc:
+            print(f"Langfuse query failed (attempt {attempt}): {exc}")
+            time.sleep(2)
+            continue
+
+        observations = [
+            item for item in data.get("data", [])
+            if item.get("sessionId") == session_id
+        ]
+        if not observations:
+            print(f"waiting for Langfuse observations... attempt {attempt}")
+            time.sleep(2)
+            continue
+
+        names = [item.get("name") for item in observations]
+        trace_ids = sorted({item.get("traceId") for item in observations})
+        print(f"Langfuse observations: {len(observations)}")
+        print(f"Langfuse trace: {trace_ids[0] if trace_ids else 'unknown'}")
+        print("observations:", ", ".join(names))
+        required = {"session", "prompt", "agent.turn", "session.summary"}
+        missing = required.difference(names)
+        if missing:
+            print("FAILED: missing Langfuse observations:", ", ".join(sorted(missing)))
+            return 1
+        print("OK: events exported to Langfuse")
+        return 0
+
+    print("NO LANGFUSE OBSERVATIONS")
+    return 1
 
 
 def main():
@@ -141,6 +219,10 @@ def main():
     expected_trace = hashlib.sha256(f"trace:{session_id}".encode()).hexdigest()[:32]
     print(f"session: {session_id}")
     print(f"trace:   {expected_trace}")
+
+    backend = detect_backend()
+    if backend == "langfuse":
+        return verify_langfuse(session_id)
 
     now = datetime.now(timezone.utc)
     params = {

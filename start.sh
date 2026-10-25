@@ -2,6 +2,13 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+if [ -f collector.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./collector.env
+  set +a
+fi
+
 if [ -f collector.pid ] && kill -0 "$(cat collector.pid)" 2>/dev/null; then
   echo "collector already running (pid $(cat collector.pid))"
   exit 0
