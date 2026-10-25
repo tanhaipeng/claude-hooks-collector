@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::app::AppState;
 use crate::spans::SpanDraft;
@@ -255,28 +255,11 @@ fn build_summary_span(job: &SummaryJob, usage: &UsageStats) -> SpanDraft {
             "claude.timing.source".to_string(),
             "session_summary".to_string(),
         ),
-        (
-            "langfuse.observation.type".to_string(),
-            "generation".to_string(),
-        ),
-        ("langfuse.session.id".to_string(), job.session_id.clone()),
-        (
-            "langfuse.observation.usage_details".to_string(),
-            json!({
-                "input": usage.input_tokens,
-                "output": usage.output_tokens,
-                "total": total_tokens,
-                "cache_read_input_tokens": usage.cache_read_input_tokens,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-            })
-            .to_string(),
-        ),
     ];
 
     if let Some(model) = &model {
         attributes.push(("claude.model".to_string(), model.clone()));
         attributes.push(("gen_ai.request.model".to_string(), model.clone()));
-        attributes.push(("langfuse.observation.model.name".to_string(), model.clone()));
     }
 
     SpanDraft {
@@ -358,22 +341,9 @@ pub(crate) async fn run_turn_usage(state: Arc<AppState>, job: TurnUsageJob) {
         span.attributes
             .push(("claude.usage.prompt_id".to_string(), prompt_id.clone()));
     }
-    span.attributes.push((
-        "langfuse.observation.usage_details".to_string(),
-        json!({
-            "input": usage.input_tokens,
-            "output": usage.output_tokens,
-            "total": total_tokens,
-            "cache_read_input_tokens": usage.cache_read_input_tokens,
-            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-        })
-        .to_string(),
-    ));
     if let Some(model) = usage.models.first() {
         span.attributes
             .push(("gen_ai.request.model".to_string(), model.clone()));
-        span.attributes
-            .push(("langfuse.observation.model.name".to_string(), model.clone()));
     }
 
     if let Err(error) = state.inner.tx.send(span).await {

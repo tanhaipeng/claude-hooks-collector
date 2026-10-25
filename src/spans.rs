@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::util::{add_scalar, set_attr, string_field};
+use crate::util::{add_scalar, string_field};
 
 pub(crate) struct SpanDraft {
     pub(crate) trace_id: String,
@@ -56,56 +56,6 @@ pub(crate) fn base_attributes(
 
     if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
         attributes.push(("claude.prompt_length".to_string(), prompt.len().to_string()));
-        set_attr(
-            &mut attributes,
-            "langfuse.observation.input",
-            json!({ "prompt": prompt }).to_string(),
-        );
-    }
-
-    if let Some(expanded) = payload.get("expanded_prompt").and_then(Value::as_str) {
-        set_attr(
-            &mut attributes,
-            "langfuse.observation.input",
-            json!({ "prompt": expanded }).to_string(),
-        );
-    }
-
-    if let Some(tool_input) = payload.get("tool_input") {
-        set_attr(
-            &mut attributes,
-            "langfuse.observation.input",
-            json!({ "tool_input": tool_input }).to_string(),
-        );
-    }
-
-    for output_key in ["tool_response", "tool_output"] {
-        if let Some(output) = payload.get(output_key) {
-            set_attr(
-                &mut attributes,
-                "langfuse.observation.output",
-                json!({ "tool_output": output }).to_string(),
-            );
-        }
-    }
-
-    if let Some(last_message) = payload
-        .get("last_assistant_message")
-        .and_then(Value::as_str)
-    {
-        set_attr(
-            &mut attributes,
-            "langfuse.observation.output",
-            json!({ "text": last_message }).to_string(),
-        );
-    }
-
-    if let Some(error) = payload.get("error").and_then(Value::as_str) {
-        set_attr(
-            &mut attributes,
-            "langfuse.observation.output",
-            json!({ "error": error }).to_string(),
-        );
     }
 
     // OTel GenAI semantic conventions, in addition to the raw Claude attributes.
@@ -151,19 +101,6 @@ pub(crate) fn base_attributes(
     if let Some(model) = &model {
         attributes.push(("gen_ai.request.model".to_string(), model.clone()));
     }
-
-    let langfuse_type = match event {
-        "Stop" | "StopFailure" => "generation",
-        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => "tool",
-        "MessageDisplay" => "event",
-        "SubagentStart" | "SubagentStop" => "agent",
-        _ => "span",
-    };
-    attributes.push((
-        "langfuse.observation.type".to_string(),
-        langfuse_type.to_string(),
-    ));
-    attributes.push(("langfuse.session.id".to_string(), session_id.to_string()));
 
     attributes.push((
         "claude.timing.source".to_string(),

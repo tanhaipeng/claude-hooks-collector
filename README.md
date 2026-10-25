@@ -18,12 +18,11 @@
 - 保留完整事件内容：`claude.hook.payload` 是原始 JSON，不截断
 - 有状态的父子关系：`session → agent.turn → prompt/tool/subagent/task/...`
 - 每个事件独立采集；Pre/Post 用两个 span + OTel links 表达配对
-- Langfuse 语义映射：observation type、model、usage、session id、input/output
+- 同一套 OTLP/HTTP 输出兼容 Jaeger 和 Langfuse（通过 endpoint/headers 切换）
 - GenAI semconv：`gen_ai.operation.name`、`gen_ai.tool.*`、`gen_ai.usage.*` 等
 - `agent.turn` 每轮 token；`session.summary` 累计 token
-- 有界队列、批量导出、重试、本地 spool、TTL 清理、SIGINT/SIGTERM 优雅退出
-- spool 目录 `0700`、文件 `0600`
-- 5 分钟事件幂等；transcript 增量解析；重复 Hook 不会重复生成 span
+- 有界队列、批量导出、失败重试、TTL 清理、SIGINT/SIGTERM 优雅退出
+- transcript 增量解析
 - 支持 HTTPS（reqwest + rustls）
 
 ## 快速开始
@@ -64,7 +63,7 @@ Axum collector :4321
   ▼
 OTLP/HTTP
   │ 失败重试 3 次
-  ├─ 仍失败 → spool/*.json → 定时/启动时重放
+  │ 仍失败 → 记录错误并丢弃该批
   ▼
 Jaeger :4318
   或 Langfuse :3000/api/public/otel/v1/traces
@@ -82,13 +81,12 @@ Jaeger :4318
 | `src/main.rs` | 进程入口，只调用 `app::run` |
 | `src/lib.rs` | 模块导出 |
 | `src/config.rs` | `collector.env`/环境变量解析、OTLP header、endpoint |
-| `src/app.rs` | AppState、启动、exporter/replay/TTL task、优雅退出 |
+| `src/app.rs` | AppState、启动、exporter/TTL task、优雅退出 |
 | `src/http.rs` | Axum 路由、`/hooks`、`/health` |
 | `src/hooks.rs` | Hook 事件分发、session/turn/tool 状态机、span 组装、TTL 清理 |
 | `src/state.rs` | `SessionState`、pair、MessageStream 状态类型 |
-| `src/spans.rs` | SpanDraft、Claude/GenAI/Langfuse 属性、OTLP JSON 转换 |
+| `src/spans.rs` | SpanDraft、Claude/GenAI 属性、OTLP JSON 转换 |
 | `src/exporter.rs` | 队列 worker、批量、重试 |
-| `src/spool.rs` | spool 权限、原子写入、启动/定时重放 |
 | `src/usage.rs` | transcript token 增量解析、turn/session token job |
 | `src/util.rs` | ID、时间、字段提取等纯工具 |
 
@@ -98,7 +96,7 @@ Jaeger :4318
 cargo test
 ```
 
-当前有 10 个测试，覆盖 config、util、attributes、transcript 增量解析、token 去重、spool 权限。
+当前有 9 个测试，覆盖 config、util、attributes、transcript 增量解析、token 去重。
 
 ## OTel 资源命名
 
@@ -137,10 +135,8 @@ LANGFUSE_AUTH=<base64(pk:sk)>
 | `OTLP_ENDPOINT` | `http://127.0.0.1:4318` | 自动补 `/v1/traces`；支持 http/https |
 | `OTLP_HEADERS` | 空 | `key=value,key=value`，用于 Langfuse Basic Auth 等 |
 | `QUEUE_CAPACITY` | `4096` | 有界队列；满了丢 span 并计数 |
-| `SPOOL_DIR` | `spool` | 导出失败后的落盘目录 |
 | `SESSION_TTL_SECS` | `3600` | 无活动 session 清理时间；0 禁用 |
 | `TTL_SWEEP_SECS` | `60` | TTL 扫描间隔 |
-| `SPOOL_REPLAY_SECS` | `30` | spool 重放间隔 |
 
 健康检查：
 
@@ -156,7 +152,6 @@ otlp_headers_configured
 sessions
 queue_capacity / queue_available
 dropped_total
-spool_dir
 ```
 
 `/health` 目前是进程存活检查，不探测后端是否可达。
@@ -204,16 +199,27 @@ OTLP_HEADERS='Authorization=Basic <base64(public:secret)>,x-langfuse-ingestion-v
 
 `x-langfuse-ingestion-version: 4` 用于 Langfuse v4 实时 ingestion。
 
-### Langfuse 字段映射
+### Langfuse 兼容范围
 
-- `agent.turn` / `session.summary` → `GENERATION`
-- `tool.*` → `TOOL`
-- `message.display` → `EVENT`
-- 其他事件 → `SPAN` 或 `AGENT`
-- `langfuse.session.id` 用于 session 聚合
-- `langfuse.observation.model.name` 用于模型名
-- `langfuse.observation.usage_details` 包含 input/output/total/cache token
-- `langfuse.observation.input` / `output` 包含 prompt、tool input/output、答案文本
+当前 collector **不再写入 `langfuse.*` 专属属性**。Langfuse 仍然可以通过
+OTLP/HTTP 接收 trace，但只能看到通用的 `claude.*` / `gen_ai.*` 属性：
+
+- span 名称、trace 层级、时间、状态正常
+- 没有 `langfuse.observation.type`
+- 没有 `langfuse.observation.input/output`
+- 没有 `langfuse.observation.usage_details`
+- 没有 `langfuse.session.id` / `langfuse.observation.model.name`
+
+token 仍然保留在：
+
+```text
+gen_ai.usage.input_tokens
+gen_ai.usage.output_tokens
+claude.usage.*
+```
+
+如果需要在 Langfuse UI 里获得完整 observation/input/output/usage 映射，需要重新加一个
+可选的 Langfuse backend mapper，而不是放在核心属性里。
 
 如果 UI 报 **Project Not Found**：
 
@@ -475,7 +481,7 @@ claude.timing.source
 gen_ai.conversation.id
 ```
 
-Langfuse / GenAI：
+GenAI：
 
 ```text
 gen_ai.operation.name
@@ -483,11 +489,6 @@ gen_ai.tool.name / gen_ai.tool.call.id
 gen_ai.agent.name / gen_ai.agent.id
 gen_ai.request.model
 gen_ai.usage.input_tokens / output_tokens
-langfuse.observation.type
-langfuse.session.id
-langfuse.observation.model.name
-langfuse.observation.usage_details
-langfuse.observation.input / output
 ```
 
 数值/布尔属性会导出为 `intValue` / `boolValue`；重复 key 会在导出前合并。
@@ -555,18 +556,18 @@ message.delta
 - 有界队列：`QUEUE_CAPACITY`，满了丢 span 并计 `dropped_total`
 - 批量：最多 64 个或 250ms 一批
 - 失败重试：3 次
-- spool：重试仍失败写 `spool/batch-*.json`；启动时立即重放
-- spool 4xx 坏批次重命名为 `.bad-*`
+- 重试仍失败：记录错误并丢弃该批（不落盘、不重放）
 - TTL：超时清理 session，补发 `session.timeout` / `agent.turn.incomplete`
 - SIGINT/SIGTERM：优雅停止，等待 exporter drain
-- 幂等：相同 event + 完整 payload 在 5 分钟内只处理一次
-- ID：session root 每次进程唯一；turn/tool 等 ID 含 root 前缀，降低重启重复风险
+- ID：session root 每次进程唯一；turn/tool 等 ID 含 root 前缀，降低重启重复 ID 风险
+- 不做事件幂等：重复 Hook 会产生重复 span
 
 ## 验证
 
 ```bash
 cargo check
 cargo build
+cargo test
 python3 simulate.py
 ```
 
@@ -577,6 +578,7 @@ python3 simulate.py
 3. Jaeger 模式查询 `/api/v3/traces`
 4. Langfuse 模式查询 `/api/public/v2/observations`
 5. 校验 35 个 span/observation、payload、token、message events
+6. 不校验 `langfuse.*` 属性，因为当前已移除 Langfuse 专属映射
 
 Jaeger 当前示例 trace：
 
@@ -593,7 +595,7 @@ Jaeger 当前示例 trace：
 - **Jaeger memory storage**：重启丢 trace
 - **一轮一个 turn**：同 session 当前只维护一个 active turn；Claude 正常串行
 - **transcript schema**：依赖 Claude JSONL 的 `promptId` / `message.id` / `usage` 字段，Claude 改格式时需要适配
-- **CI/metrics 未完成**：已有 10 个 Rust 单测，但还没有 CI 和 Prometheus metrics
+- **CI/metrics 未完成**：已有 9 个 Rust 单测，但还没有 CI 和 Prometheus metrics
 
 ## 排查
 
@@ -611,7 +613,6 @@ curl http://127.0.0.1:4321/health
 - Hook 是否请求了 `127.0.0.1:4321`
 - `collector.env` 的 `OTLP_ENDPOINT` 是否正确
 - 后端是否启动
-- `spool/` 是否有积压
 
 ### Langfuse Project Not Found
 
@@ -636,10 +637,11 @@ cp collector.env.langfuse collector.env
 当前已知可改进项：
 
 1. Langfuse/MinIO 端口绑定 127.0.0.1
-2. health 增加后端可达性、spool 数量、last export error
-3. 单后端 → 多后端双写
+2. health 增加后端可达性、last export error
+3. 如确实需要，再做多后端双写
 4. CI + mock OTLP 集成测试
 5. 支持 OTLP/gRPC / Protobuf
 6. FileChanged matcher
 7. 更精确的工具耗时（transcript 时间戳）
 8. metrics（Prometheus）
+9. 需要 Langfuse 完整 UI 映射时，加可选 Langfuse backend mapper

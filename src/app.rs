@@ -10,12 +10,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::{
-    config::Config,
-    exporter::exporter_worker,
-    hooks::expire_sessions,
-    http::router,
+    config::Config, exporter::exporter_worker, hooks::expire_sessions, http::router,
     spans::SpanDraft,
-    spool::{ensure_private_dir, replay_loop},
 };
 
 #[derive(Clone)]
@@ -27,15 +23,11 @@ pub(crate) struct Inner {
     pub(crate) sessions: Mutex<HashMap<String, crate::state::SessionState>>,
     pub(crate) tx: mpsc::Sender<SpanDraft>,
     pub(crate) otlp_endpoint: String,
-    pub(crate) spool_dir: std::path::PathBuf,
     pub(crate) otlp_headers_configured: bool,
-    pub(crate) recent_events: Mutex<HashMap<String, u64>>,
     pub(crate) dropped_total: AtomicU64,
 }
 
 pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    ensure_private_dir(&config.spool_dir).await?;
-
     let (tx, rx) = mpsc::channel(config.queue_capacity);
     let client = reqwest::Client::builder()
         .default_headers(config.otlp_headers.clone())
@@ -45,25 +37,12 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             sessions: Mutex::new(HashMap::new()),
             tx,
             otlp_endpoint: config.otlp_endpoint.clone(),
-            spool_dir: config.spool_dir.clone(),
             otlp_headers_configured: config.otlp_headers_configured,
-            recent_events: Mutex::new(HashMap::new()),
             dropped_total: AtomicU64::new(0),
         }),
     });
 
-    let exporter = tokio::spawn(exporter_worker(
-        rx,
-        client.clone(),
-        config.otlp_endpoint.clone(),
-        config.spool_dir.clone(),
-    ));
-    let replay = tokio::spawn(replay_loop(
-        client,
-        config.otlp_endpoint.clone(),
-        config.spool_dir.clone(),
-        config.spool_replay_seconds,
-    ));
+    let exporter = tokio::spawn(exporter_worker(rx, client, config.otlp_endpoint.clone()));
     let ttl = if config.ttl_seconds > 0 {
         Some(spawn_ttl(
             state.clone(),
@@ -79,7 +58,6 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     tracing::info!(
         listen_addr = %config.listen_addr,
         otlp_endpoint = %config.otlp_endpoint,
-        spool = %config.spool_dir.display(),
         queue_capacity = config.queue_capacity,
         ttl_seconds = config.ttl_seconds,
         "claude hooks collector listening"
@@ -92,8 +70,6 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     if let Some(handle) = ttl {
         handle.abort();
     }
-    replay.abort();
-
     // Closing the last sender lets the exporter drain its queue before exiting.
     drop(state);
     match tokio::time::timeout(Duration::from_secs(10), exporter).await {

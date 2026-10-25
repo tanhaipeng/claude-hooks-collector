@@ -59,14 +59,6 @@ pub(crate) fn bool_field(payload: &Value, key: &str) -> Option<bool> {
     payload.get(key).and_then(Value::as_bool)
 }
 
-pub(crate) fn set_attr(attributes: &mut Vec<(String, String)>, key: &str, value: String) {
-    if let Some(existing) = attributes.iter_mut().find(|(known, _)| known == key) {
-        existing.1 = value;
-    } else {
-        attributes.push((key.to_string(), value));
-    }
-}
-
 pub(crate) fn add_scalar(
     attributes: &mut Vec<(String, String)>,
     payload: &Value,

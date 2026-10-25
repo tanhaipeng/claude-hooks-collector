@@ -1,14 +1,10 @@
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::spans::{SpanDraft, otlp_body};
-use crate::spool::spool_batch;
 
 async fn export_batch(
     client: &reqwest::Client,
@@ -28,12 +24,7 @@ async fn export_batch(
     Ok(())
 }
 
-async fn flush_batch(
-    client: &reqwest::Client,
-    endpoint: &str,
-    spool_dir: &Path,
-    spans: &[SpanDraft],
-) {
+async fn flush_batch(client: &reqwest::Client, endpoint: &str, spans: &[SpanDraft]) {
     if spans.is_empty() {
         return;
     }
@@ -54,25 +45,16 @@ async fn flush_batch(
         }
     }
 
-    match spool_batch(spool_dir, &body).await {
-        Ok(()) => tracing::error!(
-            spans = spans.len(),
-            spool = %spool_dir.display(),
-            "OTLP batch failed after retries; spooled for replay"
-        ),
-        Err(error) => tracing::error!(
-            spans = spans.len(),
-            error = %error,
-            "OTLP batch failed and could not be spooled"
-        ),
-    }
+    tracing::error!(
+        spans = spans.len(),
+        "OTLP batch failed after retries; dropping batch"
+    );
 }
 
 pub(crate) async fn exporter_worker(
     mut rx: mpsc::Receiver<SpanDraft>,
     client: reqwest::Client,
     endpoint: String,
-    spool_dir: PathBuf,
 ) {
     let mut batch = Vec::with_capacity(64);
     let mut ticker = interval(Duration::from_millis(250));
@@ -85,13 +67,13 @@ pub(crate) async fn exporter_worker(
                     Some(span) => {
                         batch.push(span);
                         if batch.len() >= 64 {
-                            flush_batch(&client, &endpoint, &spool_dir, &batch).await;
+                            flush_batch(&client, &endpoint, &batch).await;
                             batch.clear();
                         }
                     }
                     None => {
                         if !batch.is_empty() {
-                            flush_batch(&client, &endpoint, &spool_dir, &batch).await;
+                            flush_batch(&client, &endpoint, &batch).await;
                         }
                         break;
                     }
@@ -99,7 +81,7 @@ pub(crate) async fn exporter_worker(
             }
             _ = ticker.tick() => {
                 if !batch.is_empty() {
-                    flush_batch(&client, &endpoint, &spool_dir, &batch).await;
+                    flush_batch(&client, &endpoint, &batch).await;
                     batch.clear();
                 }
             }

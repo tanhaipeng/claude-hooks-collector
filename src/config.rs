@@ -1,4 +1,4 @@
-use std::{env, error::Error, path::PathBuf};
+use std::{env, error::Error};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
@@ -7,11 +7,9 @@ pub struct Config {
     pub(crate) otlp_endpoint: String,
     pub(crate) otlp_headers: HeaderMap,
     pub(crate) otlp_headers_configured: bool,
-    pub(crate) spool_dir: PathBuf,
     pub(crate) queue_capacity: usize,
     pub(crate) ttl_seconds: u64,
     pub(crate) ttl_sweep_seconds: u64,
-    pub(crate) spool_replay_seconds: u64,
 }
 
 impl Config {
@@ -20,8 +18,6 @@ impl Config {
         let otlp_endpoint = normalize_otlp_endpoint(
             &env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:4318".to_string()),
         );
-        let spool_dir =
-            PathBuf::from(env::var("SPOOL_DIR").unwrap_or_else(|_| "spool".to_string()));
         let otlp_headers = parse_otlp_headers(&env::var("OTLP_HEADERS").unwrap_or_default());
         let otlp_headers_configured = !otlp_headers.is_empty();
         let queue_capacity = env::var("QUEUE_CAPACITY")
@@ -37,21 +33,15 @@ impl Config {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(60);
-        let spool_replay_seconds = env::var("SPOOL_REPLAY_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(30);
 
         Ok(Self {
             listen_addr,
             otlp_endpoint,
             otlp_headers,
             otlp_headers_configured,
-            spool_dir,
             queue_capacity,
             ttl_seconds,
             ttl_sweep_seconds,
-            spool_replay_seconds,
         })
     }
 }
