@@ -4,3 +4,4 @@ collector.pid
 /spool
 .idea/
 collector.env
+collector.env.langfuse

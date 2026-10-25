@@ -2,7 +2,7 @@
 
 接收 Claude Code 的 **HTTP 类型 Hook**，把每个 Hook 事件转换成 OTel span，
 通过 **OTLP/HTTP** 上报到 Langfuse、Jaeger 或其他兼容后端。
-当前默认配置发送到本地 **Langfuse**（`http://127.0.0.1:3000/api/public/otel/v1/traces`）。
+当前后端由 `collector.env` 决定；本机现在发送到 **Jaeger**（`http://127.0.0.1:4318/v1/traces`），Langfuse 接入方式见下文。
 
 ## 特性
 
@@ -155,7 +155,7 @@ python3 simulate.py
 `usage_details` 包含 `input` / `output` / `total` / cache token，模型名写入
 `langfuse.observation.model.name`。
 
-当前不再向 Jaeger 双写：旧 Jaeger trace 保留，新 trace 只发 Langfuse。
+切换后端时不做双写：当前 `collector.env` 已切回 Jaeger，新 trace 只发 Jaeger；Langfuse 数据仍保留在其 Docker Volume。
 如果要切换回 Jaeger，修改 `collector.env` 的 `OTLP_ENDPOINT` 并重启 collector。
 
 ## 不影响 Claude 流程
