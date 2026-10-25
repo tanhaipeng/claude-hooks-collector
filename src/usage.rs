@@ -384,9 +384,26 @@ pub(crate) async fn run_turn_usage(state: Arc<AppState>, job: TurnUsageJob) {
         span.attributes
             .push(("claude.usage.prompt_id".to_string(), prompt_id.clone()));
     }
-    if let Some(model) = usage.models.first() {
+    let usage_model = usage.models.first().cloned();
+    let has_request_model = span
+        .attributes
+        .iter()
+        .any(|(key, _)| key == "gen_ai.request.model");
+    if !has_request_model {
+        if let Some(model) = &usage_model {
+            span.attributes
+                .push(("gen_ai.request.model".to_string(), model.clone()));
+        }
+    }
+    if let Some(model) = &usage_model {
+        // Qoder reports the provider key (qfmodel) in the transcript, while
+        // the Hook payload carries the user-facing model (Qwen3.8-Flash).
+        // Keep the payload model on gen_ai.request.model and expose the
+        // provider key separately.
         span.attributes
-            .push(("gen_ai.request.model".to_string(), model.clone()));
+            .push(("gen_ai.response.model".to_string(), model.clone()));
+        span.attributes
+            .push(("claude.usage.model".to_string(), model.clone()));
     }
     if state.inner.langfuse {
         span.attributes.push((
@@ -406,9 +423,15 @@ pub(crate) async fn run_turn_usage(state: Arc<AppState>, job: TurnUsageJob) {
             })
             .to_string(),
         ));
-        if let Some(model) = usage.models.first() {
-            span.attributes
-                .push(("langfuse.observation.model.name".to_string(), model.clone()));
+        let has_langfuse_model = span
+            .attributes
+            .iter()
+            .any(|(key, _)| key == "langfuse.observation.model.name");
+        if !has_langfuse_model {
+            if let Some(model) = &usage_model {
+                span.attributes
+                    .push(("langfuse.observation.model.name".to_string(), model.clone()));
+            }
         }
     }
 

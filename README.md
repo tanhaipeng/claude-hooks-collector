@@ -377,7 +377,7 @@ Qoder 配置：`~/.qoder/settings.json`
 
 实测 Qoder 会话 trace：
 
-<http://127.0.0.1:16686/trace/b802f639c251be1cef578b4616cf9c02>
+<http://127.0.0.1:16686/trace/a688f42fbb316f4323d93fa90faa9078>
 
 包含：
 
@@ -397,6 +397,10 @@ session.summary
   - collector 现在会用 `request_set_id` / `parent_request_set_id` 作为 turn ID 和 token job 的 fallback
   - turn/tool span 正常
   - per-turn token job 会创建，但 Qoder 当前返回的 token 仍为 0
+- Qoder 的模型名有两层：
+  - Hook payload 的 `model`（如 `Qwen3.8-Flash`）→ `claude.model` / `gen_ai.request.model`
+  - transcript 的 provider model（如 `qfmodel`）→ `gen_ai.response.model` / `claude.usage.model`
+  - 不会再用 transcript model 覆盖用户看到的请求模型
 - Qoder transcript 的 `usage` 目前为 0（Qwen3.8-Flash），所以 `session.summary` token 也是 0
   - 这是 Qoder 数据源限制，不是 collector 丢失
 - Qoder 与 Claude Code 默认共用 `service.name=claude-code-hooks`
@@ -503,7 +507,9 @@ gen_ai.operation.name
 gen_ai.tool.name / gen_ai.tool.call.id
 gen_ai.agent.name / gen_ai.agent.id
 gen_ai.request.model
+gen_ai.response.model
 gen_ai.usage.input_tokens / output_tokens
+claude.usage.model
 ```
 
 Langfuse 模式额外包含：

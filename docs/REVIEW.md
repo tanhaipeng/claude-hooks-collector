@@ -28,7 +28,7 @@ HA requirement.
 ## 2. Current verified state
 
 ```text
-Collector PID: 49729
+Collector PID: 50325
 Backend: http://127.0.0.1:4318/v1/traces (Jaeger)
 Jaeger: running
 Langfuse: stopped
@@ -46,7 +46,7 @@ cargo clippy --all-targets   PASS with warnings, no errors
 
 Latest full simulation trace:
 
-<http://127.0.0.1:16686/trace/a1042e8ae4b4a4e5710be7adef6990ec>
+<http://127.0.0.1:16686/trace/d5034dc1a000dd04943793f1dbab6388>
 
 Duplicate Hook test:
 
@@ -154,13 +154,16 @@ Observed limitation:
 Qoder 1.1.78 is configured with 25 non-worktree events. A real tool session
 produced the expected span tree:
 
-<http://127.0.0.1:16686/trace/b802f639c251be1cef578b4616cf9c02>
+<http://127.0.0.1:16686/trace/a688f42fbb316f4323d93fa90faa9078>
 
 Qoder-specific handling:
 
 - `request_set_id` / `parent_request_set_id` fallback for turn ID and token job
 - transcript parser matches `requestSetId`
 - `claude.client=qoder` attribute
+- model attribution:
+  - Hook model `Qwen3.8-Flash` → `claude.model` / `gen_ai.request.model`
+  - transcript provider model `qfmodel` → `gen_ai.response.model` / `claude.usage.model`
 - `SERVICE_NAME=qoder-cli` can isolate a separate Qoder collector instance
 
 Qoder still returns zero token values for `qfmodel`, so token display is zero even
