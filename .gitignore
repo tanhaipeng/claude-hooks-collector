@@ -1,0 +1,5 @@
+/target
+collector.log
+collector.pid
+/spool
+.idea/
