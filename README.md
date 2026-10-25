@@ -1,29 +1,53 @@
-# Claude Code Hooks -> OTLP Collector (Rust + Axum)
+# Claude Code Hooks -> OTLP Collector
 
-接收 Claude Code 的 **HTTP 类型 Hook**，把每个 Hook 事件转换成 OTel span，
-通过 **OTLP/HTTP** 上报到 Langfuse、Jaeger 或其他兼容后端。
-当前后端由 `collector.env` 决定；本机现在发送到 **Jaeger**（`http://127.0.0.1:4318/v1/traces`），Langfuse 接入方式见下文。
+用 Rust + Axum 接收 **Claude Code Hook**，把 Hook 事件转换成 OpenTelemetry span，
+通过 **OTLP/HTTP** 发给 Langfuse、Jaeger 或其他兼容后端。
+
+> 项目名/包名/二进制名：`claude-hooks-collector`
+> OTel `service.name`：`claude-code-hooks`
+> OTel `service.namespace`：`claude-code`
+
+当前后端由 [`collector.env`](collector.env.example) 决定。默认代码配置是 Jaeger
+（`http://127.0.0.1:4318`），也支持 Langfuse 和 HTTPS OTLP 后端。
 
 ## 特性
 
-- Axum `POST /hooks`，直接接收 Claude Code HTTP Hook 的 JSON body
-- Collector 支持 Claude Code 当前 **33 种 Hook 事件**；默认配置启用 **31 种**（不含 WorktreeCreate/WorktreeRemove）
-- **每个 Hook 事件都采集**；`MessageDisplay` 的流式 chunk 合并为一个 span，delta 作为 span events
-- **完整保存事件 JSON**：`claude.hook.payload` 属性就是原始 body
-- 保留常用字段：`session_id`、`prompt_id`、`cwd`、`tool_name`、`tool_input`、`tool_response` 等
-- 有状态的父子关系：
-  - `session` 根 span
-  - `agent.turn` 一轮对话
-  - `tool.<name>` / `tool.<name>.result` 工具调用
-  - `subagent.<type>` / `.stop`
-  - `context.compact`、`model.switch`、`task`、`mcp.elicitation`
-- OTLP 导出异步执行，不阻塞 Claude Code Hook
-- 32MB 请求体上限，适配大工具输出
-- **P0 可靠性**：SIGINT/SIGTERM 优雅退出、有界队列、批量导出、失败重试、本地 spool 重放、TTL 清理
-- **P1 语义**：GenAI 语义属性、span links、`agent.turn` 每轮 token、`session.summary` 会话汇总、int/bool 属性类型
-- **Langfuse 可读性**：input/output、observation type、model、usage、session id
-- **安全/稳定性**：spool 目录 0700、文件 0600；5 分钟事件幂等；增量 transcript 解析
-- **HTTPS**：reqwest 启用 rustls，可发 Langfuse Cloud 或其他 HTTPS OTLP 后端
+- Axum `POST /hooks`，直接接收 Claude Code HTTP Hook 的完整 JSON
+- Claude Code 当前 **33 种 Hook 事件**：collector 全部能处理，默认配置启用 **31 种**
+- `MessageDisplay` 流式 chunk 按 `message_id` 合并成一个 span，delta 作为 span events
+- 保留完整事件内容：`claude.hook.payload` 是原始 JSON，不截断
+- 有状态的父子关系：`session → agent.turn → prompt/tool/subagent/task/...`
+- 每个事件独立采集；Pre/Post 用两个 span + OTel links 表达配对
+- Langfuse 语义映射：observation type、model、usage、session id、input/output
+- GenAI semconv：`gen_ai.operation.name`、`gen_ai.tool.*`、`gen_ai.usage.*` 等
+- `agent.turn` 每轮 token；`session.summary` 累计 token
+- 有界队列、批量导出、重试、本地 spool、TTL 清理、SIGINT/SIGTERM 优雅退出
+- spool 目录 `0700`、文件 `0600`
+- 5 分钟事件幂等；transcript 增量解析；重复 Hook 不会重复生成 span
+- 支持 HTTPS（reqwest + rustls）
+
+## 快速开始
+
+```bash
+cd /Users/simon/dev/claude-hooks-collector
+
+# 可选：配置后端
+cp collector.env.example collector.env
+# 编辑 collector.env
+
+./start.sh
+./status.sh
+curl http://127.0.0.1:4321/health
+```
+
+停止：
+
+```bash
+./stop.sh
+```
+
+默认监听：`127.0.0.1:4321`
+Hook 端点：`http://127.0.0.1:4321/hooks`
 
 ## 架构
 
@@ -32,31 +56,24 @@ Claude Code
   │ HTTP POST /hooks（完整事件 JSON）
   ▼
 Axum collector :4321
-  │ 状态机：session / turn / tool / subagent ...
-  │ 生成 span + parentSpanId + links
+  │ session / turn / tool / subagent 状态机
+  │ span + parentSpanId + links
   ▼
 有界队列（默认 4096）
-  │ 批量 64 个 / 250ms
+  │ 最多 64 个 / 250ms 一批
   ▼
-OTLP/HTTP → Langfuse :3000/api/public/otel/v1/traces
-  │ Basic Auth + x-langfuse-ingestion-version: 4
+OTLP/HTTP
   │ 失败重试 3 次
-  ├─ 仍失败 → spool/*.json → 定时重放
+  ├─ 仍失败 → spool/*.json → 定时/启动时重放
   ▼
-Langfuse UI :3000
+Jaeger :4318
+  或 Langfuse :3000/api/public/otel/v1/traces
+  或任意 OTLP/HTTP HTTPS 后端
 ```
 
-也可以是 Jaeger：
-
-```text
-OTLP_ENDPOINT=http://127.0.0.1:4318
-```
-
-此时 trace 只发 Jaeger，不并发双写。
+一次只发一个后端，不做双写。切换后端只需要改 `collector.env` 并重启 collector。
 
 ## OTel 资源命名
-
-上报的 resource attributes：
 
 | 属性 | 值 |
 |---|---|
@@ -64,24 +81,39 @@ OTLP_ENDPOINT=http://127.0.0.1:4318
 | `service.namespace` | `claude-code` |
 | `service.version` | `0.1.0` |
 | `telemetry.sdk.name` | `claude-hooks-collector` |
+| `telemetry.sdk.language` | `rust` |
 | `telemetry.source` | `hooks` |
 
-说明：
+`service.name` 表示“Claude Code Hook 遥测的生产者”，不是 Claude Code 本体。
 
-- 项目/目录/二进制仍叫 `claude-hooks-collector`
-- Langfuse 里的 **service 名**是 `claude-code-hooks`，表示“Claude Code 的 Hook 遥测”
-- `service.namespace=claude-code` 保留产品归属
-- 之前写入 Jaeger 的旧 trace 仍显示在 `claude-code` service 下；新 trace 发往 Langfuse
+## 配置
 
-## 运行
+`start.sh` 会 source 项目根目录的 `collector.env`（该文件已 gitignore）。
+示例见 [`collector.env.example`](collector.env.example)。
 
 ```bash
-./start.sh
-./status.sh
-./stop.sh
+# Jaeger
+OTLP_ENDPOINT=http://127.0.0.1:4318
+
+# Langfuse
+OTLP_ENDPOINT=http://127.0.0.1:3000/api/public/otel
+OTLP_HEADERS='Authorization=Basic <base64(pk:sk)>,x-langfuse-ingestion-version=4'
+LANGFUSE_HOST=http://127.0.0.1:3000
+LANGFUSE_AUTH=<base64(pk:sk)>
 ```
 
-默认监听：`http://127.0.0.1:4321`
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `LISTEN_ADDR` | `127.0.0.1:4321` | collector 监听地址 |
+| `OTLP_ENDPOINT` | `http://127.0.0.1:4318` | 自动补 `/v1/traces`；支持 http/https |
+| `OTLP_HEADERS` | 空 | `key=value,key=value`，用于 Langfuse Basic Auth 等 |
+| `QUEUE_CAPACITY` | `4096` | 有界队列；满了丢 span 并计数 |
+| `SPOOL_DIR` | `spool` | 导出失败后的落盘目录 |
+| `SESSION_TTL_SECS` | `3600` | 无活动 session 清理时间；0 禁用 |
+| `TTL_SWEEP_SECS` | `60` | TTL 扫描间隔 |
+| `SPOOL_REPLAY_SECS` | `30` | spool 重放间隔 |
 
 健康检查：
 
@@ -89,28 +121,22 @@ OTLP_ENDPOINT=http://127.0.0.1:4318
 curl http://127.0.0.1:4321/health
 ```
 
-环境变量：
-
-| 变量 | 默认值 |
-|---|---|
-| `LISTEN_ADDR` | `127.0.0.1:4321` |
-| `OTLP_ENDPOINT` | `http://127.0.0.1:3000/api/public/otel`（会自动补 `/v1/traces`，支持 http/https） |
-| `OTLP_HEADERS` | 可选，`key=value,key=value`；Langfuse 需要 Basic Auth 和 `x-langfuse-ingestion-version=4` |
-| `QUEUE_CAPACITY` | `4096`（有界队列；满了丢 span 并计数） |
-| `SPOOL_DIR` | `spool`（导出失败后的落盘目录） |
-| `SESSION_TTL_SECS` | `3600`（0 表示禁用 TTL） |
-| `TTL_SWEEP_SECS` | `60`（TTL 扫描间隔） |
-| `SPOOL_REPLAY_SECS` | `30`（spool 重放间隔） |
-
-## Langfuse 本地部署
-
-本次已安装到：
+返回包含：
 
 ```text
-/Users/simon/dev/langfuse
+otlp_endpoint
+otlp_headers_configured
+sessions
+queue_capacity / queue_available
+dropped_total
+spool_dir
 ```
 
-运行方式：
+`/health` 目前是进程存活检查，不探测后端是否可达。
+
+## Langfuse 接入
+
+Langfuse 自托管（Docker Compose）示例：
 
 ```bash
 cd /Users/simon/dev/langfuse
@@ -124,72 +150,90 @@ UI：
 http://localhost:3000
 ```
 
-登录账号和初始密码保存在 `langfuse/.env` 的 `LANGFUSE_INIT_USER_*` 变量里。
-Project：`claude-hooks`；Organization：`claude-code`。
+Headless 初始化会使用 `.env` 里的：
 
-后端运行时：
+```text
+LANGFUSE_INIT_USER_EMAIL
+LANGFUSE_INIT_USER_PASSWORD
+LANGFUSE_INIT_ORG_ID
+LANGFUSE_INIT_PROJECT_ID
+LANGFUSE_INIT_PROJECT_PUBLIC_KEY
+LANGFUSE_INIT_PROJECT_SECRET_KEY
+```
 
-- Docker 使用 Colima；已设置 `brew services start colima` 开机自启
-- Langfuse 容器使用 `restart: always`
-- 停止 Langfuse：`docker-compose down`（数据卷保留）
+当前项目：
 
-Collector 使用 `collector.env`（已 gitignore）配置 Langfuse：
+```text
+Organization: claude-code
+Project:      claude-hooks
+```
+
+Collector 配置：
 
 ```bash
 OTLP_ENDPOINT=http://127.0.0.1:3000/api/public/otel
-OTLP_HEADERS='Authorization=Basic <base64(pk:sk)>,x-langfuse-ingestion-version=4'
-LANGFUSE_HOST=http://127.0.0.1:3000
-LANGFUSE_AUTH=<base64(pk:sk)>
+OTLP_HEADERS='Authorization=Basic <base64(public:secret)>,x-langfuse-ingestion-version=4'
 ```
 
-`start.sh` 会自动 source 这个文件。示例见
-[collector.env.example](collector.env.example)。
+`x-langfuse-ingestion-version: 4` 用于 Langfuse v4 实时 ingestion。
 
-验证：
+### Langfuse 字段映射
+
+- `agent.turn` / `session.summary` → `GENERATION`
+- `tool.*` → `TOOL`
+- `message.display` → `EVENT`
+- 其他事件 → `SPAN` 或 `AGENT`
+- `langfuse.session.id` 用于 session 聚合
+- `langfuse.observation.model.name` 用于模型名
+- `langfuse.observation.usage_details` 包含 input/output/total/cache token
+- `langfuse.observation.input` / `output` 包含 prompt、tool input/output、答案文本
+
+如果 UI 报 **Project Not Found**：
+
+1. 确认登录的是有 `claude-code` 组织权限的账号
+2. 确认该用户在 `projects`/`project_memberships` 中有 `claude-hooks`
+3. 退出登录后重新登录，或使用无痕窗口
+
+这是 Langfuse 的项目成员权限问题，不是 collector 上报失败。
+
+### 停止 Langfuse
 
 ```bash
-python3 simulate.py
+cd /Users/simon/dev/langfuse
+docker-compose down
 ```
 
-`simulate.py` 会检测 collector 的 OTLP endpoint；如果指向 Langfuse，
-会查询 `GET /api/public/v2/observations` 并确认 35 个 observation 已到达。
+数据卷会保留。不要用 `docker-compose down -v`，否则 Langfuse 的 ClickHouse/MinIO/Postgres 数据会被删除。
 
-`agent.turn` / `session.summary` 会映射为 Langfuse 的 `GENERATION`，
-`usage_details` 包含 `input` / `output` / `total` / cache token，模型名写入
-`langfuse.observation.model.name`。
+## Jaeger 接入
 
-同时补充 Langfuse input/output：
+Jaeger 不需要额外 OTel Collector：
 
-- `prompt` → `langfuse.observation.input`
-- `tool.*` → tool_input / tool_output
-- `agent.turn` → 本轮 prompt / last_assistant_message
-- `message.display` → 合并后的流式文本
+```bash
+cd /Users/simon/Documents/deepseek-harness/default-workspace/jaeger
+./start.sh
+```
 
-spool 目录权限为 `0700`，batch 文件为 `0600`。同一个 Hook 事件在 5 分钟内重复提交会被忽略。
+端点：
 
-切换后端时不做双写：当前 `collector.env` 已切回 Jaeger，新 trace 只发 Jaeger；Langfuse 数据仍保留在其 Docker Volume。
-如果要切换回 Jaeger，修改 `collector.env` 的 `OTLP_ENDPOINT` 并重启 collector。
+```text
+UI:        http://localhost:16686
+OTLP HTTP: http://localhost:4318
+OTLP gRPC: localhost:4317
+```
 
-## 不影响 Claude 流程
+配置：
 
-默认 hook 配置按“遥测失败不能阻塞 Claude”设计：
+```bash
+OTLP_ENDPOINT=http://127.0.0.1:4318
+```
 
-- HTTP Hook 的 connection failure / 非 2xx / timeout 默认是非阻塞错误，Claude 继续执行。
-- `SessionStart` 用 `command + curl`，加了 `--max-time 2`，并且 `>/dev/null 2>&1 || true`，失败也退出 0。
-- `WorktreeCreate` / `WorktreeRemove` **没有启用**：这两个事件有特殊失败契约，WorktreeCreate 的 hook 会替换 Claude 默认的 `git worktree` 行为，返回空 204 可能导致 worktree 创建失败。为避免影响 Claude，默认配置直接不挂这两个事件；collector 仍能处理它们，但只建议在你明确要自定义 worktree 时手动配置。
-- 没有配置 `onFailure: "block"`。
-
-如果 collector 没启动，Claude 仍能继续执行，只是没有 trace；原生 HTTP Hook
-可能显示一条 `hook ... failed` / `hook error` 提示，但这是非阻塞错误，不会中断
-prompt、工具调用或会话。实测 collector 停止时 `claude -p` 仍以 exit 0 完成。
-
-默认 HTTP Hook 的 `timeout` 设为 2 秒，SessionStart 的 curl 也限制为 2 秒，
-避免 collector 卡住时拖慢 Claude。
+注意：当前 Jaeger 是 **memory storage**，停止后 trace 丢失。需要持久化时给 Jaeger 配 Badger/ClickHouse 等 storage。
 
 ## 配置 Claude Code
 
-把 [claude-hooks.json](claude-hooks.json) 里的 `hooks` 合并进
-`~/.claude/settings.json`（或项目 `.claude/settings.json`）。
+把 [`claude-hooks.json`](claude-hooks.json) 的 `hooks` 合并进
+`~/.claude/settings.json`，修改后重启 Claude Code。
 
 先备份：
 
@@ -218,21 +262,64 @@ for event, groups in fragment["hooks"].items():
 settings_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 ```
 
-如果你设置了 `allowedHttpHookUrls`，记得把
-`http://127.0.0.1:4321/hooks` 加进白名单：
+如果设置了 `allowedHttpHookUrls`，加入：
 
 ```json
-{
-  "allowedHttpHookUrls": ["http://127.0.0.1:4321/hooks"]
-}
+"allowedHttpHookUrls": ["http://127.0.0.1:4321/hooks"]
 ```
 
-配置修改后需要**重启 Claude Code**。
+### 默认启用的 31 个事件
 
-> **SessionStart 的特殊处理**：Claude Code 的 `SessionStart` 只支持
-> `type: "command"` 和 `type: "mcp_tool"`，不支持 HTTP Hook。
-> 所以 `claude-hooks.json` 里 `SessionStart` 用 `curl` 把 JSON 转发给
-> 同一个 `/hooks` 端点，其他事件使用原生 `type: "http"`。
+```text
+SessionStart, Setup, UserPromptSubmit, UserPromptExpansion,
+PreToolUse, PermissionRequest, PermissionDenied,
+PostToolUse, PostToolUseFailure, PostToolBatch,
+Notification, MessageDisplay,
+SubagentStart, SubagentStop,
+TaskCreated, TaskCompleted,
+Stop, StopFailure, TeammateIdle,
+InstructionsLoaded, ConfigChange, CwdChanged, DirectoryAdded,
+FileChanged, PreCompact, PostCompact,
+PreModelSwitch, PostModelSwitch,
+Elicitation, ElicitationResult, SessionEnd
+```
+
+### 为什么没有 WorktreeCreate / WorktreeRemove
+
+这两个事件有特殊失败契约：
+
+- `WorktreeCreate` Hook 会替换 Claude 默认的 `git worktree` 行为
+- HTTP Hook 需要返回 `hookSpecificOutput.worktreePath`
+- 返回空 204 可能导致 worktree 创建失败
+
+默认配置不挂这两个事件，避免遥测影响 Claude 的 worktree 流程。Collector 仍能处理它们，但只建议在明确实现自定义 worktree 时启用。
+
+### 为什么 SessionStart 用 command + curl
+
+Claude Code 的 `SessionStart` 只支持 `type: "command"` 和 `type: "mcp_tool"`，不支持 HTTP Hook。
+
+所以：
+
+```bash
+/usr/bin/curl -s --max-time 2 --connect-timeout 1 \
+  -X POST http://127.0.0.1:4321/hooks \
+  -H 'Content-Type: application/json' \
+  --data-binary @- >/dev/null 2>&1 || true
+```
+
+失败也退出 0，不会阻塞 Claude 启动。
+
+## Hook 失败是否影响 Claude
+
+默认配置是 fail-open：
+
+- HTTP Hook 连接失败、非 2xx、timeout：非阻塞错误
+- `SessionStart` 的 curl 失败被 `|| true` 吞掉
+- 没有配置 `onFailure: "block"`
+- 默认 timeout 为 2 秒
+
+实测 collector 停止时，`claude -p` 仍以 exit 0 完成；输出可能出现一条
+`hook ... failed` 提示，但不会中断 prompt 或工具调用。
 
 ## 事件映射
 
@@ -261,121 +348,134 @@ settings_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 | `Elicitation` | `mcp.elicitation` | MCP 询问开始 |
 | `ElicitationResult` | `mcp.elicitation.result` | MCP 询问结束 |
 | `Notification` | `notification` | 通知 |
-| `MessageDisplay` | `message.display` | 消息显示 |
+| `MessageDisplay` | `message.display` | 流式消息合并 |
 | `TeammateIdle` | `teammate.idle` | teammate 空闲 |
 | `InstructionsLoaded` | `instructions.loaded` | 指令加载 |
 | `ConfigChange` | `config.change` | 配置变更 |
 | `CwdChanged` | `cwd.changed` | 工作目录变更 |
 | `DirectoryAdded` | `directory.added` | 添加目录 |
 | `FileChanged` | `file.changed` | 文件变更 |
-| `WorktreeCreate` | `worktree.create` | 默认配置未启用，避免影响 Claude worktree |
-| `WorktreeRemove` | `worktree.remove` | 默认配置未启用 |
+| `WorktreeCreate` | `worktree.create` | 默认未启用 |
+| `WorktreeRemove` | `worktree.remove` | 默认未启用 |
 | `SessionEnd` | `session.end` | 会话结束 |
 | 其他/未知事件 | `event.<name>` | 兜底 |
 
-所有 span 的父节点规则：
+### trace 树
 
 ```text
 session
 ├── session.summary
 ├── agent.turn
-├── agent.turn.incomplete   # 异常结束/TTL 时出现
 │   ├── prompt
+│   ├── prompt.expansion
 │   ├── tool.Read
 │   ├── tool.Read.result
 │   ├── tool.Bash
 │   ├── tool.Bash.result
 │   ├── subagent.Explore
 │   ├── subagent.Explore.stop
-│   └── ...
+│   ├── task
+│   ├── task.result
+│   ├── context.compact
+│   ├── context.compact.result
+│   ├── model.switch
+│   ├── model.switch.result
+│   ├── mcp.elicitation
+│   └── mcp.elicitation.result
+├── agent.turn.incomplete   # SessionEnd/TTL 时若仍有 active turn
 ├── setup
 ├── permission.request
 └── session.end
 ```
 
-注意：为了“每个事件都可见”，`PreToolUse` 和 `PostToolUse` 是两个 span：
+Pre/Post、Start/Stop 是兄弟节点，通过 `claude.paired_span_id` 和 OTel links 关联。
 
-- `tool.Read`：PreToolUse，零时长
-- `tool.Read.result`：PostToolUse，带 duration，并带 `claude.paired_span_id`
+## 属性
 
-这样做的好处是：
+每个事件 span 至少包含：
 
-- PreToolUse 事件本身不会丢
-- 即使 PostToolUse 永远没来，PreToolUse 的完整内容也已经上报
+```text
+claude.hook.event
+claude.hook.payload          # 完整原始 JSON
+claude.hook.payload_bytes
+claude.session_id
+claude.prompt_id
+claude.cwd
+claude.permission_mode
+claude.tool_name / claude.tool_use_id
+claude.agent_id / claude.agent_type
+claude.prompt_length
+claude.paired_span_id
+claude.timing.source
+gen_ai.conversation.id
+```
 
-## 完整事件内容
+Langfuse / GenAI：
 
-每个 span 都带：
+```text
+gen_ai.operation.name
+gen_ai.tool.name / gen_ai.tool.call.id
+gen_ai.agent.name / gen_ai.agent.id
+gen_ai.request.model
+gen_ai.usage.input_tokens / output_tokens
+langfuse.observation.type
+langfuse.session.id
+langfuse.observation.model.name
+langfuse.observation.usage_details
+langfuse.observation.input / output
+```
 
-| 属性 | 内容 |
-|---|---|
-| `claude.hook.event` | 事件名 |
-| `claude.hook.payload` | **完整原始 JSON** |
-| `claude.hook.payload_bytes` | 原始 JSON 字节数 |
-| `claude.session_id` | 会话 ID |
-| `claude.prompt_id` | prompt ID |
-| `claude.cwd` | 工作目录 |
-| `claude.permission_mode` | 权限模式 |
-| `claude.tool_name` / `claude.tool_use_id` | 工具信息 |
-| `claude.agent_id` / `claude.agent_type` | 子 agent 信息 |
-| `claude.prompt_length` | prompt 长度 |
-| `claude.paired_span_id` | 配对 span 的 ID |
-| `claude.timing.source` | `hook_receipt` / `turn_usage` / `session_summary` |
-| `claude.message.id` | 流式消息 ID |
-| `claude.message.chunk_count` | 合并的 delta 数量 |
-| `claude.message.total_chars` | 合并后的总字符数 |
-| `claude.message.first_index` / `last_index` | delta 索引范围 |
-| `claude.message.duration_ms` | 首个 delta 到 final 的时长 |
-| `gen_ai.conversation.id` | 会话 ID |
-| `gen_ai.operation.name` | `execute_tool` / `invoke_agent` |
-| `gen_ai.tool.name` / `gen_ai.tool.call.id` | 工具语义 |
-| `gen_ai.agent.name` / `gen_ai.agent.id` | 子 agent 语义 |
-| `gen_ai.request.model` | 模型名（如果事件里有） |
+数值/布尔属性会导出为 `intValue` / `boolValue`；重复 key 会在导出前合并。
 
-配对结果 span 还会带 OTel **links**，指向 Pre/Start span。
+## Token
 
-### agent.turn 的 token
+### agent.turn
 
-`Stop` / `StopFailure` 后会从 transcript 解析**当前 turn** 的 token，挂到 `agent.turn`：
+`Stop` / `StopFailure` 后从 transcript 解析当前 turn：
 
-| 属性 | 内容 |
-|---|---|
-| `gen_ai.usage.input_tokens` / `output_tokens` | 本轮 token |
-| `claude.usage.cache_read_input_tokens` / `cache_creation_input_tokens` | 缓存 token |
-| `claude.usage.total_tokens` | 本轮总 token |
-| `claude.usage.scope` | `turn` |
-| `claude.usage.source` | `transcript` |
-| `claude.usage.prompt_id` | 对应 prompt |
-| `gen_ai.request.model` | 模型名 |
+```text
+gen_ai.usage.input_tokens
+gen_ai.usage.output_tokens
+claude.usage.total_tokens
+claude.usage.cache_read_input_tokens
+claude.usage.cache_creation_input_tokens
+claude.usage.scope = turn
+claude.usage.source = transcript
+claude.usage.prompt_id
+```
 
-按 assistant `message.id` 去重，避免 Claude transcript 里同一响应的多个
-content block 被重复计算。`Stop` 可能早于 transcript flush，因此最多重试
-6 次、每次 300ms。
+按 assistant `message.id` 去重，避免同一响应多个 content block 重复计数。
 
-如果会话在 `Stop` 之前异常结束（`SessionEnd` 或 TTL 清理），collector 会补发：
+transcript 按 session 维护 `usage_offset`，Stop 只解析新增区间，不每轮重扫全文件。
+`Stop` 可能早于 transcript flush，最多重试 6 次，每次 300ms。
+
+如果 SessionEnd/TTL 时还有未关闭 turn，会补发：
 
 ```text
 agent.turn.incomplete
   claude.turn.incomplete = true
-  claude.turn.reason     = session_end_without_stop / session_timeout
+  claude.turn.reason = session_end_without_stop / session_timeout
 ```
 
-这样 `prompt` / `tool.*` 不会成为没有父节点的孤儿 span。
+### session.summary
 
-### session.summary 的 token
+`SessionEnd` 后生成累计 token 汇总：
 
-`session.summary` 仍是整个 session 的累计 token：
+```text
+gen_ai.usage.input_tokens
+gen_ai.usage.output_tokens
+claude.usage.total_tokens
+claude.usage.cache_read_input_tokens
+claude.usage.cache_creation_input_tokens
+claude.session.duration_ms
+claude.turn_count
+claude.tool_count
+claude.subagent_count
+```
 
-| 属性 | 内容 |
-|---|---|
-| `claude.session.duration_ms` | 整个 session 时长 |
-| `claude.turn_count` / `claude.tool_count` / `claude.subagent_count` | 事件计数 |
-| `gen_ai.usage.input_tokens` / `output_tokens` | 累计 token |
-| `claude.usage.cache_read_input_tokens` / `cache_creation_input_tokens` | 缓存 token |
-| `claude.usage.total_tokens` | 总 token |
-| `gen_ai.request.model` | 模型名 |
+### message.display
 
-`message.display` 的每个流式 delta 会变成该 span 的一个 **span event**：
+流式 delta 合并成一个 span，每个 delta 是 span event：
 
 ```text
 message.delta
@@ -385,72 +485,96 @@ message.delta
   claude.message.delta
 ```
 
-因此长回复不会再产生 N 个 `message.display` span，而是一个 span + N 个事件。
+## 可靠性
 
-`claude.hook.payload` 是完整 JSON，不截断。因此：
-
-- `UserPromptSubmit` 的 prompt 全文在里面
-- `PreToolUse` 的 `tool_input` 全文在
-- `PostToolUse` 的 `tool_response` 全文在
-- `PermissionRequest` / `Elicitation` 的所有字段都在
+- 有界队列：`QUEUE_CAPACITY`，满了丢 span 并计 `dropped_total`
+- 批量：最多 64 个或 250ms 一批
+- 失败重试：3 次
+- spool：重试仍失败写 `spool/batch-*.json`；启动时立即重放
+- spool 4xx 坏批次重命名为 `.bad-*`
+- TTL：超时清理 session，补发 `session.timeout` / `agent.turn.incomplete`
+- SIGINT/SIGTERM：优雅停止，等待 exporter drain
+- 幂等：相同 event + 完整 payload 在 5 分钟内只处理一次
+- ID：session root 每次进程唯一；turn/tool 等 ID 含 root 前缀，降低重启重复风险
 
 ## 验证
 
 ```bash
-./start.sh
+cargo check
+cargo build
 python3 simulate.py
 ```
 
-`simulate.py` 会发送 36 条 Hook（33 种事件 + 一次额外 PreToolUse + 两个额外
-MessageDisplay chunk），期望生成 **35 个 span**（34 个事件 span + 1 个
-`session.summary`；3 个流式 chunk 合并成 1 个 `message.display`），然后：
+`simulate.py` 会：
 
-1. 等 Jaeger 索引
-2. 按 `session_id` 计算 trace ID
-3. 检查 span 数量、payload、prompt/tool 标记、`agent.turn` 和 `session.summary` 的 token 属性
+1. 发送 36 条 Hook（33 种事件 + 额外 PreToolUse + 2 个额外 MessageDisplay chunk）
+2. 自动检测 collector 的 OTLP endpoint
+3. Jaeger 模式查询 `/api/v3/traces`
+4. Langfuse 模式查询 `/api/public/v2/observations`
+5. 校验 35 个 span/observation、payload、token、message events
 
-最后输出类似：
+Jaeger 当前示例 trace：
 
-```text
-session                    event=SessionStart ...
-  setup                    event=Setup ...
-  agent.turn               event=Stop ...
-    prompt                 event=UserPromptSubmit ...
-    prompt.expansion       event=UserPromptExpansion ...
-    tool.Read              event=PreToolUse ...
-    tool.Read.result       event=PostToolUse ...
-    ...
-  session.end              event=SessionEnd ...
-OK: all hook events exported with full payload
+<http://127.0.0.1:16686>
+
+## 安全与限制
+
+- **隐私**：`claude.hook.payload` 包含 prompt、工具输入输出、文件内容；只应发本地或可信后端
+- **默认监听 localhost**：不要把 collector 的 `/hooks` 暴露到公网
+- **Langfuse**：自托管时建议把 3000/9090 绑定 `127.0.0.1`，当前 compose 默认监听所有网卡
+- **无鉴权**：`/hooks` 没有 token，适合本地；远程部署需要加认证或反向代理
+- **单后端**：一次只发 Jaeger 或 Langfuse，不做双写
+- **不支持 gRPC/Protobuf**：当前只支持 OTLP/HTTP JSON
+- **Jaeger memory storage**：重启丢 trace
+- **一轮一个 turn**：同 session 当前只维护一个 active turn；Claude 正常串行
+- **transcript schema**：依赖 Claude JSONL 的 `promptId` / `message.id` / `usage` 字段，Claude 改格式时需要适配
+- **无 metrics/CI**：健康检查只有 liveness，没有 Prometheus metrics；Rust 单测和 CI 尚未补齐
+
+## 排查
+
+### collector 没数据
+
+```bash
+cd /Users/simon/dev/claude-hooks-collector
+./status.sh
+tail -50 collector.log
+curl http://127.0.0.1:4321/health
 ```
 
-## 注意
+确认：
 
-1. **隐私**：prompt、工具输入、工具输出、文件内容都会进 `claude.hook.payload`。
-   这套服务只应监听 `127.0.0.1`，Jaeger 也不要把端口暴露到公网。
-2. **体积**：大工具输出可能让单个 span 超过 OTLP/Jaeger 的限制。
-   服务端已放宽到 32MB，但 Jaeger 的 OTLP 接收端仍可能拒绝超大请求；
-   必要时在前面加 OTel Collector 并调整 `max_recv_msg_size`。
-3. **状态**：session/turn/tool 状态在内存里；collector 重启会丢未关闭的配对，
-   已经上报的 span 不受影响。超过 `SESSION_TTL_SECS` 的 session 会生成
-   `session.timeout` 和（如果有未关闭 turn）`agent.turn.incomplete`，然后清理。
-4. **一轮一个 turn**：同一个 session 当前只维护一个 `turn_id`，Claude Code 正常是串行 turn；
-   如果将来并行，需要改成 map/stack。
-5. **HTTP Hook 返回**：collector 立即返回 `204`，导出由后台队列/worker 执行，
-   不让 Jaeger 的延迟阻塞 Claude Code。
-6. **token 成本**：当前统计 token，不计算美元成本；成本需要额外的模型价目表。
-   `agent.turn` 是每轮 token，`session.summary` 是累计 token。
-7. **关停**：`Ctrl-C` 和 `SIGTERM` 都会触发优雅退出；`stop.sh` 会等待 exporter
-   drain 完成，超时才 SIGKILL。
-8. **属性类型**：`gen_ai.usage.*`、`*_count`、`*_ms`、`*_tokens` 等导出为
-   `intValue`；`claude.message.final`、`claude.turn.incomplete` 等导出为
-   `boolValue`。重复 key 会在导出前合并。
-9. **spool**：启动时立即尝试重放；4xx 的坏批次会重命名为 `.bad-*`，避免阻塞后续批次。
-10. **FileChanged**：当前配置没有 matcher，Claude 可能不会触发该事件；需要时在
-    `claude-hooks.json` 里补 `matcher`（例如 `.envrc|.env`）。
-11. **耗时精度**：工具耗时仍是“Pre/Post Hook 收到时间差”，
-   属性 `claude.timing.source=hook_receipt` 标明了这一点；更精确的耗时需要
-   从 transcript 里解析工具时间戳。
-12. **流式消息**：`MessageDisplay` 按 `message_id` 合并到 `final=true`；
-   未收到 final 时，会在 Stop/SessionEnd/TTL 时以
-   `message.display.incomplete` 补发。
+- Hook 是否请求了 `127.0.0.1:4321`
+- `collector.env` 的 `OTLP_ENDPOINT` 是否正确
+- 后端是否启动
+- `spool/` 是否有积压
+
+### Langfuse Project Not Found
+
+检查当前登录账号是否属于 `claude-code` 组织，并且在 `claude-hooks` 项目有 membership。修复后退出登录重新进入。
+
+### 切换后端
+
+```bash
+# 切 Jaeger
+printf 'OTLP_ENDPOINT=http://127.0.0.1:4318\n' > collector.env
+./stop.sh && ./start.sh
+
+# 切 Langfuse（保留 collector.env.langfuse 备份时）
+cp collector.env.langfuse collector.env
+./stop.sh && ./start.sh
+```
+
+## Review 与后续改进
+
+完整 review 记录见 [docs/REVIEW.md](docs/REVIEW.md)。
+
+当前已知可改进项：
+
+1. Langfuse/MinIO 端口绑定 127.0.0.1
+2. health 增加后端可达性、spool 数量、last export error
+3. 单后端 → 多后端双写
+4. Rust 单测 + CI
+5. 支持 OTLP/gRPC / Protobuf
+6. FileChanged matcher
+7. 更精确的工具耗时（transcript 时间戳）
+8. metrics（Prometheus）
