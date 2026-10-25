@@ -2,7 +2,8 @@
 
 Review date: 2026-10-25
 Project: `/Users/simon/dev/claude-hooks-collector`
-Review commit: `a1d1cc0` (working tree includes documentation updates)
+Review code commit: `a1d1cc0`
+Docs commit: `4db4ea5`
 
 ## 1. Executive summary
 
