@@ -6,7 +6,7 @@ use crate::app::AppState;
 use crate::spans::{SpanDraft, base_attributes};
 use crate::state::{MessageChunk, MessageStream, SessionState, StartState};
 use crate::usage::{SummaryJob, TurnUsageJob};
-use crate::util::{bool_field, hex_id, now_ns, string_field, u64_field, unique_span_id};
+use crate::util::{bool_field, hex_id, now_ns, set_attr, string_field, u64_field, unique_span_id};
 
 pub(crate) struct EventOutput {
     pub(crate) spans: Vec<SpanDraft>,
@@ -45,6 +45,7 @@ fn build_message_span(
     end_ns: u64,
     name: &str,
     mut attributes: Vec<(String, String)>,
+    langfuse: bool,
     error: bool,
 ) -> SpanDraft {
     let mut chunks = stream.chunks.clone();
@@ -88,6 +89,14 @@ fn build_message_span(
         duration_ms.to_string(),
     ));
     attributes.push(("gen_ai.conversation.id".to_string(), session_id.to_string()));
+    if langfuse {
+        let full_text: String = chunks.iter().map(|chunk| chunk.delta.as_str()).collect();
+        set_attr(
+            &mut attributes,
+            "langfuse.observation.output",
+            json!({ "text": full_text }).to_string(),
+        );
+    }
     attributes.push((
         "claude.message.chunks_json".to_string(),
         serde_json::to_string(&chunks_json).unwrap_or_default(),
@@ -110,6 +119,7 @@ fn drain_messages(
     parent_id: &str,
     end_ns: u64,
     name: &str,
+    langfuse: bool,
     error: bool,
 ) -> Vec<SpanDraft> {
     let streams = std::mem::take(&mut session.messages);
@@ -131,6 +141,7 @@ fn drain_messages(
                     ),
                     ("claude.session_id".to_string(), session.session_id.clone()),
                 ],
+                langfuse,
                 error,
             )
         })
@@ -186,7 +197,53 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
     let mut summary = None;
     let mut turn_usage = None;
     let raw_payload = payload.to_string();
-    let base_attrs = base_attributes(payload, &raw_payload, &event, &session_id);
+    let base_attrs = base_attributes(
+        payload,
+        &raw_payload,
+        &event,
+        &session_id,
+        state.inner.langfuse,
+    );
+
+    let event_key = hex_id(&format!("{event}:{raw_payload}"), 16);
+    {
+        let mut recent = state
+            .inner
+            .recent_events
+            .lock()
+            .expect("recent events lock");
+        let cutoff = now.saturating_sub(300 * 1_000_000_000);
+        recent.retain(|_, timestamp| *timestamp >= cutoff);
+        if recent.contains_key(&event_key) {
+            tracing::info!(
+                session_id = %session_id,
+                event = %event,
+                "duplicate hook event ignored"
+            );
+            return EventOutput {
+                spans: Vec::new(),
+                summary: None,
+                turn_usage: None,
+            };
+        }
+        recent.insert(event_key, now);
+    }
+
+    if event == "SessionEnd"
+        && !state
+            .inner
+            .sessions
+            .lock()
+            .expect("sessions lock")
+            .contains_key(&session_id)
+    {
+        tracing::info!(session_id = %session_id, "ignoring SessionEnd without an active session");
+        return EventOutput {
+            spans: Vec::new(),
+            summary: None,
+            turn_usage: None,
+        };
+    }
 
     let mut sessions = state.inner.sessions.lock().expect("sessions lock");
     let existed = sessions.contains_key(&session_id);
@@ -200,6 +257,7 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
             turn_start_ns: None,
             pairs: HashMap::new(),
             messages: HashMap::new(),
+            turn_prompt: None,
             usage_offset: 0,
             start_ns: now,
             last_seen_ns: now,
@@ -257,6 +315,10 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
     match event.as_str() {
         "UserPromptSubmit" => {
             session.turn_count += 1;
+            session.turn_prompt = payload
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
             let turn_id = string_field(payload, "prompt_id")
                 .map(|prompt_id| hex_id(&format!("turn:{}:{prompt_id}", session.root_id), 8))
                 .unwrap_or_else(|| unique_span_id("turn"));
@@ -275,8 +337,14 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
         }
 
         "Stop" | "StopFailure" => {
-            let mut pending =
-                drain_messages(session, &parent, now, "message.display.incomplete", true);
+            let mut pending = drain_messages(
+                session,
+                &parent,
+                now,
+                "message.display.incomplete",
+                state.inner.langfuse,
+                true,
+            );
             spans.append(&mut pending);
 
             let turn_id = session
@@ -286,7 +354,16 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
             let start_ns = session.turn_start_ns.unwrap_or(now);
             session.turn_id = None;
             session.turn_start_ns = None;
-            let turn_attrs = attrs;
+            let mut turn_attrs = attrs;
+            if let Some(prompt) = session.turn_prompt.take() {
+                if state.inner.langfuse {
+                    set_attr(
+                        &mut turn_attrs,
+                        "langfuse.observation.input",
+                        json!({ "prompt": prompt }).to_string(),
+                    );
+                }
+            }
             let turn_span = SpanDraft {
                 trace_id: session.trace_id.clone(),
                 span_id: turn_id,
@@ -634,6 +711,7 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                         now,
                         "message.display",
                         message_attrs,
+                        state.inner.langfuse,
                         false,
                     ));
                 }
@@ -648,6 +726,7 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 &turn_parent,
                 now,
                 "message.display.incomplete",
+                state.inner.langfuse,
                 true,
             );
             spans.append(&mut pending);
@@ -728,6 +807,7 @@ pub(crate) fn expire_sessions(state: &AppState, ttl_ns: u64) {
                 &turn_parent,
                 now,
                 "message.display.incomplete",
+                state.inner.langfuse,
                 true,
             ) {
                 if let Err(error) = state.inner.tx.try_send(span) {

@@ -49,6 +49,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "otel_service_namespace": "claude-code",
         "otlp_endpoint": state.inner.otlp_endpoint,
         "otlp_headers_configured": state.inner.otlp_headers_configured,
+        "langfuse": state.inner.langfuse,
         "sessions": state.inner.sessions.lock().map(|sessions| sessions.len()).unwrap_or(0),
         "queue_capacity": state.inner.tx.max_capacity(),
         "queue_available": state.inner.tx.capacity(),

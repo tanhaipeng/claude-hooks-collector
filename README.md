@@ -19,9 +19,11 @@
 - 有状态的父子关系：`session → agent.turn → prompt/tool/subagent/task/...`
 - 每个事件独立采集；Pre/Post 用两个 span + OTel links 表达配对
 - 同一套 OTLP/HTTP 输出兼容 Jaeger 和 Langfuse（通过 endpoint/headers 切换）
+- **Langfuse UI 适配**：检测到 Langfuse endpoint 时自动补 `langfuse.observation.*`；Jaeger 模式不写这些字段
 - GenAI semconv：`gen_ai.operation.name`、`gen_ai.tool.*`、`gen_ai.usage.*` 等
 - `agent.turn` 每轮 token；`session.summary` 累计 token
 - 有界队列、批量导出、失败重试、TTL 清理、SIGINT/SIGTERM 优雅退出
+- **重复 Hook 去重**：相同 event + 完整 payload 在 5 分钟内只处理一次
 - transcript 增量解析
 - 支持 HTTPS（reqwest + rustls）
 
@@ -96,7 +98,7 @@ Jaeger :4318
 cargo test
 ```
 
-当前有 9 个测试，覆盖 config、util、attributes、transcript 增量解析、token 去重。
+当前有 10 个测试，覆盖 config、util、attributes、transcript 增量解析、token 去重。
 
 ## OTel 资源命名
 
@@ -134,6 +136,7 @@ LANGFUSE_AUTH=<base64(pk:sk)>
 | `LISTEN_ADDR` | `127.0.0.1:4321` | collector 监听地址 |
 | `OTLP_ENDPOINT` | `http://127.0.0.1:4318` | 自动补 `/v1/traces`；支持 http/https |
 | `OTLP_HEADERS` | 空 | `key=value,key=value`，用于 Langfuse Basic Auth 等 |
+| `OTEL_BACKEND` | 自动 | `langfuse` / `jaeger` / `generic`；留空按 endpoint 自动判断 |
 | `QUEUE_CAPACITY` | `4096` | 有界队列；满了丢 span 并计数 |
 | `SESSION_TTL_SECS` | `3600` | 无活动 session 清理时间；0 禁用 |
 | `TTL_SWEEP_SECS` | `60` | TTL 扫描间隔 |
@@ -149,6 +152,7 @@ curl http://127.0.0.1:4321/health
 ```text
 otlp_endpoint
 otlp_headers_configured
+langfuse
 sessions
 queue_capacity / queue_available
 dropped_total
@@ -195,31 +199,34 @@ Collector 配置：
 ```bash
 OTLP_ENDPOINT=http://127.0.0.1:3000/api/public/otel
 OTLP_HEADERS='Authorization=Basic <base64(public:secret)>,x-langfuse-ingestion-version=4'
+OTEL_BACKEND=langfuse
 ```
 
 `x-langfuse-ingestion-version: 4` 用于 Langfuse v4 实时 ingestion。
 
-### Langfuse 兼容范围
+### Langfuse 字段映射
 
-当前 collector **不再写入 `langfuse.*` 专属属性**。Langfuse 仍然可以通过
-OTLP/HTTP 接收 trace，但只能看到通用的 `claude.*` / `gen_ai.*` 属性：
-
-- span 名称、trace 层级、时间、状态正常
-- 没有 `langfuse.observation.type`
-- 没有 `langfuse.observation.input/output`
-- 没有 `langfuse.observation.usage_details`
-- 没有 `langfuse.session.id` / `langfuse.observation.model.name`
-
-token 仍然保留在：
+collector 会根据 endpoint 或 `OTEL_BACKEND` 自动启用 Langfuse mapper：
 
 ```text
-gen_ai.usage.input_tokens
-gen_ai.usage.output_tokens
-claude.usage.*
+OTEL_BACKEND=langfuse
 ```
 
-如果需要在 Langfuse UI 里获得完整 observation/input/output/usage 映射，需要重新加一个
-可选的 Langfuse backend mapper，而不是放在核心属性里。
+启用后写入：
+
+- `langfuse.observation.type`
+- `langfuse.session.id`
+- `langfuse.observation.input/output`
+- `langfuse.observation.usage_details`
+- `langfuse.observation.model.name`
+
+Jaeger 模式（默认 `http://127.0.0.1:4318`）不会写这些字段。
+
+注意：
+
+- 如果只设置 Langfuse endpoint 但使用非标准 host/port，显式设置
+  `OTEL_BACKEND=langfuse` 更可靠
+- Qoder 没有 `prompt_id`，当前 per-turn token 仍可能为空
 
 如果 UI 报 **Project Not Found**：
 
@@ -491,6 +498,16 @@ gen_ai.request.model
 gen_ai.usage.input_tokens / output_tokens
 ```
 
+Langfuse 模式额外包含：
+
+```text
+langfuse.observation.type
+langfuse.session.id
+langfuse.observation.input / output
+langfuse.observation.usage_details
+langfuse.observation.model.name
+```
+
 数值/布尔属性会导出为 `intValue` / `boolValue`；重复 key 会在导出前合并。
 
 ## Token
@@ -560,7 +577,7 @@ message.delta
 - TTL：超时清理 session，补发 `session.timeout` / `agent.turn.incomplete`
 - SIGINT/SIGTERM：优雅停止，等待 exporter drain
 - ID：session root 每次进程唯一；turn/tool 等 ID 含 root 前缀，降低重启重复 ID 风险
-- 不做事件幂等：重复 Hook 会产生重复 span
+- 重复 Hook 去重：相同 event + 完整 payload 在 5 分钟内只处理一次
 
 ## 验证
 
@@ -578,7 +595,7 @@ python3 simulate.py
 3. Jaeger 模式查询 `/api/v3/traces`
 4. Langfuse 模式查询 `/api/public/v2/observations`
 5. 校验 35 个 span/observation、payload、token、message events
-6. 不校验 `langfuse.*` 属性，因为当前已移除 Langfuse 专属映射
+6. Jaeger 模式不写 `langfuse.*`；Langfuse 模式由 `OTEL_BACKEND`/endpoint 自动启用
 
 Jaeger 当前示例 trace：
 

@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::util::{add_scalar, string_field};
+use crate::util::{add_scalar, set_attr, string_field};
 
 pub(crate) struct SpanDraft {
     pub(crate) trace_id: String,
@@ -18,6 +18,7 @@ pub(crate) fn base_attributes(
     raw: &str,
     event: &str,
     session_id: &str,
+    langfuse: bool,
 ) -> Vec<(String, String)> {
     let mut attributes = vec![
         ("claude.hook.event".to_string(), event.to_string()),
@@ -56,6 +57,10 @@ pub(crate) fn base_attributes(
 
     if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
         attributes.push(("claude.prompt_length".to_string(), prompt.len().to_string()));
+    }
+
+    if langfuse {
+        add_langfuse_attributes(&mut attributes, payload, event, session_id);
     }
 
     // OTel GenAI semantic conventions, in addition to the raw Claude attributes.
@@ -100,6 +105,13 @@ pub(crate) fn base_attributes(
 
     if let Some(model) = &model {
         attributes.push(("gen_ai.request.model".to_string(), model.clone()));
+        if langfuse {
+            set_attr(
+                &mut attributes,
+                "langfuse.observation.model.name",
+                model.clone(),
+            );
+        }
     }
 
     attributes.push((
@@ -108,6 +120,75 @@ pub(crate) fn base_attributes(
     ));
 
     attributes
+}
+
+fn add_langfuse_attributes(
+    attributes: &mut Vec<(String, String)>,
+    payload: &Value,
+    event: &str,
+    session_id: &str,
+) {
+    let observation_type = match event {
+        "Stop" | "StopFailure" => "generation",
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => "tool",
+        "MessageDisplay" => "event",
+        "SubagentStart" | "SubagentStop" => "agent",
+        _ => "span",
+    };
+    set_attr(
+        attributes,
+        "langfuse.observation.type",
+        observation_type.to_string(),
+    );
+    set_attr(attributes, "langfuse.session.id", session_id.to_string());
+
+    if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
+        set_attr(
+            attributes,
+            "langfuse.observation.input",
+            json!({ "prompt": prompt }).to_string(),
+        );
+    }
+    if let Some(expanded) = payload.get("expanded_prompt").and_then(Value::as_str) {
+        set_attr(
+            attributes,
+            "langfuse.observation.input",
+            json!({ "prompt": expanded }).to_string(),
+        );
+    }
+    if let Some(tool_input) = payload.get("tool_input") {
+        set_attr(
+            attributes,
+            "langfuse.observation.input",
+            json!({ "tool_input": tool_input }).to_string(),
+        );
+    }
+    for output_key in ["tool_response", "tool_output"] {
+        if let Some(output) = payload.get(output_key) {
+            set_attr(
+                attributes,
+                "langfuse.observation.output",
+                json!({ "tool_output": output }).to_string(),
+            );
+        }
+    }
+    if let Some(last_message) = payload
+        .get("last_assistant_message")
+        .and_then(Value::as_str)
+    {
+        set_attr(
+            attributes,
+            "langfuse.observation.output",
+            json!({ "text": last_message }).to_string(),
+        );
+    }
+    if let Some(error) = payload.get("error").and_then(Value::as_str) {
+        set_attr(
+            attributes,
+            "langfuse.observation.output",
+            json!({ "error": error }).to_string(),
+        );
+    }
 }
 
 fn is_integer_attribute(key: &str) -> bool {

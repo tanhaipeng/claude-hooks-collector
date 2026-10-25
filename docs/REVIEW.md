@@ -10,7 +10,7 @@ The project is a local **Claude Code / Qoder Hook → OTLP** collector. It build
 session/turn/tool span trees, preserves full Hook payloads, derives token usage
 from Claude transcripts, and exports OTLP/HTTP to one backend at a time.
 
-The runtime target is intentionally small:
+Runtime shape:
 
 ```text
 Claude Code / Qoder
@@ -28,7 +28,7 @@ HA requirement.
 ## 2. Current verified state
 
 ```text
-Collector PID: 48070
+Collector PID: 48711
 Backend: http://127.0.0.1:4318/v1/traces (Jaeger)
 Jaeger: running
 Langfuse: stopped
@@ -39,27 +39,35 @@ Checks:
 ```text
 cargo check                  PASS
 cargo build                  PASS
-cargo test                   9 passed
+cargo test                   10 passed
 python3 simulate.py          PASS, 35 spans
 cargo clippy --all-targets   PASS with warnings, no errors
 ```
 
 Latest full simulation trace:
 
-<http://127.0.0.1:16686/trace/4fde2f0dd43399d7166918819ceac3c5>
+<http://127.0.0.1:16686/trace/377a45c92e3b76dfbde64bae674c3726>
 
-Health no longer exposes a spool directory:
+Duplicate Hook test:
 
-```json
-{
-  "ok": true,
-  "otlp_endpoint": "http://127.0.0.1:4318/v1/traces",
-  "otlp_headers_configured": false,
-  "sessions": 0,
-  "queue_capacity": 4096,
-  "dropped_total": 0
-}
+```text
+5 events sent twice → 6 spans
+session, prompt, tool.Read, agent.turn, session.end, session.summary
 ```
+
+Langfuse-mode mock exporter test confirmed these attributes are present when
+`OTEL_BACKEND=langfuse`:
+
+```text
+langfuse.observation.input
+langfuse.observation.output
+langfuse.observation.type
+langfuse.observation.usage_details
+langfuse.observation.model.name
+langfuse.session.id
+```
+
+Jaeger mode produced no `langfuse.*` attributes.
 
 ## 3. Current architecture
 
@@ -67,42 +75,49 @@ Health no longer exposes a spool directory:
 src/
 ├── main.rs        boot only
 ├── lib.rs         module exports
-├── config.rs      env, OTLP headers, endpoint normalization
+├── config.rs      env, OTLP headers, endpoint normalization, backend detection
 ├── app.rs         AppState, exporter/TTL tasks, graceful shutdown
 ├── http.rs        /hooks and /health
-├── hooks.rs       Hook dispatch, session/turn/tool state machine, span assembly
+├── hooks.rs       Hook dispatch, session/turn/tool state machine, dedupe, span assembly
 ├── state.rs       SessionState / MessageStream / pair types
-├── spans.rs       SpanDraft, Claude/GenAI attributes, OTLP JSON
+├── spans.rs       SpanDraft, Claude/GenAI/Langfuse attributes, OTLP JSON
 ├── exporter.rs    queue worker, batching, retry
 ├── usage.rs       incremental transcript token parsing, turn/session jobs
 └── util.rs        IDs, time, field helpers
 ```
 
-## 4. Intentional simplifications
+## 4. Intentional tradeoffs
 
-Removed in the local-single-user iteration:
+### Spool removed
 
-| Removed | Effect |
-|---|---|
-| `spool.rs` and replay | Failed batches are retried 3 times, then logged and dropped |
-| `SPOOL_DIR` / `SPOOL_REPLAY_SECS` | No disk buffer configuration |
-| 5-minute event idempotency cache | Duplicate Hook delivery can create duplicate spans |
-| `langfuse.*` attributes | Langfuse receives generic OTLP spans, not Langfuse-native observations |
-| `langfuse.observation.input/output` | Prompt/tool output is only in `claude.hook.payload` and span attributes |
-| `langfuse.observation.usage_details` | Token data remains in `gen_ai.usage.*` / `claude.usage.*` |
+Failed batches are retried 3 times, then logged and dropped.
 
-Kept deliberately:
+- No `SPOOL_DIR`
+- No replay loop
+- No disk buffer
+- If Jaeger/Langfuse is down longer than the retry window, that batch is lost
 
-- Hook fail-open behavior
-- Full payload `claude.hook.payload`
-- Parent/child span tree and Pre/Post links
-- `MessageDisplay` streaming merge
-- transcript token parsing
-- Jaeger/Langfuse endpoint and header compatibility
-- HTTPS support
-- TTL session cleanup
-- bounded queue + batching + retry
-- module-level unit tests
+This is deliberate for local single-user use.
+
+### Langfuse mapper is optional
+
+`OTEL_BACKEND=langfuse` or a Langfuse-style endpoint enables:
+
+- `langfuse.observation.type`
+- `langfuse.session.id`
+- `langfuse.observation.input/output`
+- `langfuse.observation.usage_details`
+- `langfuse.observation.model.name`
+
+Jaeger mode does not write any `langfuse.*` attributes.
+
+### Duplicate Hook dedupe
+
+Identical `event + complete payload` is processed once within a 5-minute window.
+
+- Prevents HTTP retry / duplicate configuration from creating duplicate spans
+- Cache is in-memory and resets on collector restart
+- Not a distributed idempotency guarantee
 
 ## 5. Jaeger / Langfuse compatibility
 
@@ -114,12 +129,7 @@ OTLP/HTTP JSON → /v1/traces
 
 - Jaeger: no headers
 - Langfuse: `OTLP_HEADERS` with Basic Auth and ingestion version
-
-Langfuse compatibility is **transport-level only** now. Generic spans arrive,
-but Langfuse-specific grouping, observation types, input/output, and usage
-details are not emitted. If richer Langfuse UI mapping is needed later, add an
-optional backend mapper rather than putting Langfuse attributes back into the
-core span builder.
+- Langfuse backend mapping: enabled by `OTEL_BACKEND=langfuse` or endpoint detection
 
 ## 6. Token behavior
 
@@ -144,12 +154,11 @@ Observed limitation:
 | O-01 | Medium | No CI | Add GitHub Actions for `fmt`, `clippy`, `test` |
 | O-02 | Medium | `/health` is liveness only | Add backend reachability / last export error if needed |
 | O-03 | Medium | Failed batches are dropped after retries | Accept for local use; reintroduce spool only if needed |
-| O-04 | Medium | Langfuse has no native observation mapping | Add optional Langfuse backend mapper if UI quality matters |
-| O-05 | Low | Duplicate Hook requests create duplicate spans | Reintroduce idempotency only if duplicates become a problem |
-| O-06 | Low | Qoder token usage is zero | Source limitation; collect credits later if useful |
-| O-07 | Low | `FileChanged` has no matcher | Add a matcher if that event is needed |
-| O-08 | Low | No OTLP/gRPC or Protobuf | Not needed for local OTLP/HTTP |
-| O-09 | Low | Jaeger memory storage | Restarting Jaeger loses traces |
+| O-04 | Low | Dedupe cache is per-process | Accept for single-user; use external dedupe only for multi-instance |
+| O-05 | Low | Qoder token usage is zero | Source limitation; collect credits later if useful |
+| O-06 | Low | `FileChanged` has no matcher | Add a matcher if that event is needed |
+| O-07 | Low | No OTLP/gRPC or Protobuf | Not needed for local OTLP/HTTP |
+| O-08 | Low | Jaeger memory storage | Restarting Jaeger loses traces |
 
 ## 8. Verification
 
@@ -170,8 +179,8 @@ curl http://127.0.0.1:4321/health
 
 The project is appropriately sized for a local single-user tool: one collector
 process, one backend, in-memory state, and OTLP/HTTP delivery. The code is split
-into focused modules, and the remaining complexity is mostly in Hook semantics
-and token parsing—both core features rather than infrastructure duplication.
+into focused modules, and the remaining complexity is mostly in Hook semantics,
+dedupe, and token parsing—core features rather than infrastructure duplication.
 
 Do not add an independent OTel Collector, dual write, Redis, or HA unless the
 deployment scope changes.

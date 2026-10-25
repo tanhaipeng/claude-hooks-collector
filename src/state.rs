@@ -7,6 +7,7 @@ pub(crate) struct SessionState {
     pub(crate) turn_id: Option<String>,
     pub(crate) turn_start_ns: Option<u64>,
     pub(crate) pairs: HashMap<String, StartState>,
+    pub(crate) turn_prompt: Option<String>,
     pub(crate) messages: HashMap<String, MessageStream>,
     pub(crate) usage_offset: u64,
     pub(crate) start_ns: u64,

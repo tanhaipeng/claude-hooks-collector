@@ -7,6 +7,7 @@ pub struct Config {
     pub(crate) otlp_endpoint: String,
     pub(crate) otlp_headers: HeaderMap,
     pub(crate) otlp_headers_configured: bool,
+    pub(crate) langfuse: bool,
     pub(crate) queue_capacity: usize,
     pub(crate) ttl_seconds: u64,
     pub(crate) ttl_sweep_seconds: u64,
@@ -20,6 +21,18 @@ impl Config {
         );
         let otlp_headers = parse_otlp_headers(&env::var("OTLP_HEADERS").unwrap_or_default());
         let otlp_headers_configured = !otlp_headers.is_empty();
+        let backend = env::var("OTEL_BACKEND")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let langfuse = match backend.as_str() {
+            "langfuse" => true,
+            "jaeger" | "generic" | "otel" => false,
+            _ => {
+                otlp_endpoint.contains("langfuse")
+                    || otlp_endpoint.contains("/api/public/otel")
+                    || otlp_endpoint.contains(":3000")
+            }
+        };
         let queue_capacity = env::var("QUEUE_CAPACITY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -39,6 +52,7 @@ impl Config {
             otlp_endpoint,
             otlp_headers,
             otlp_headers_configured,
+            langfuse,
             queue_capacity,
             ttl_seconds,
             ttl_sweep_seconds,
@@ -99,6 +113,15 @@ mod tests {
             normalize_otlp_endpoint("https://example.test/v1/traces"),
             "https://example.test/v1/traces"
         );
+    }
+
+    #[test]
+    fn detects_langfuse_endpoint() {
+        assert!(
+            normalize_otlp_endpoint("http://127.0.0.1:3000/api/public/otel")
+                .contains("/api/public/otel")
+        );
+        assert!(!normalize_otlp_endpoint("http://127.0.0.1:4318").contains("langfuse"));
     }
 
     #[test]
