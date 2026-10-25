@@ -28,7 +28,7 @@ HA requirement.
 ## 2. Current verified state
 
 ```text
-Collector PID: 48711
+Collector PID: 49729
 Backend: http://127.0.0.1:4318/v1/traces (Jaeger)
 Jaeger: running
 Langfuse: stopped
@@ -39,14 +39,14 @@ Checks:
 ```text
 cargo check                  PASS
 cargo build                  PASS
-cargo test                   10 passed
+cargo test                   12 passed
 python3 simulate.py          PASS, 35 spans
 cargo clippy --all-targets   PASS with warnings, no errors
 ```
 
 Latest full simulation trace:
 
-<http://127.0.0.1:16686/trace/377a45c92e3b76dfbde64bae674c3726>
+<http://127.0.0.1:16686/trace/a1042e8ae4b4a4e5710be7adef6990ec>
 
 Duplicate Hook test:
 
@@ -145,9 +145,28 @@ Observed limitation:
 
 - Qoder 1.1.78 currently reports `input_tokens=0` / `output_tokens=0` for
   `qfmodel`; the collector cannot invent values the source does not provide.
-- Qoder has no `prompt_id`; per-turn token jobs are not created for Qoder.
+- Qoder has no `prompt_id`; the collector now falls back to `request_set_id` /
+  `parent_request_set_id`, so a turn token job is created, but Qoder currently
+  returns zeros.
 
-## 7. Remaining findings
+## 7. Qoder compatibility
+
+Qoder 1.1.78 is configured with 25 non-worktree events. A real tool session
+produced the expected span tree:
+
+<http://127.0.0.1:16686/trace/b802f639c251be1cef578b4616cf9c02>
+
+Qoder-specific handling:
+
+- `request_set_id` / `parent_request_set_id` fallback for turn ID and token job
+- transcript parser matches `requestSetId`
+- `claude.client=qoder` attribute
+- `SERVICE_NAME=qoder-cli` can isolate a separate Qoder collector instance
+
+Qoder still returns zero token values for `qfmodel`, so token display is zero even
+though the parse path is now active.
+
+## 8. Remaining findings
 
 | ID | Severity | Finding | Recommendation |
 |---|---|---|---|
@@ -155,12 +174,12 @@ Observed limitation:
 | O-02 | Medium | `/health` is liveness only | Add backend reachability / last export error if needed |
 | O-03 | Medium | Failed batches are dropped after retries | Accept for local use; reintroduce spool only if needed |
 | O-04 | Low | Dedupe cache is per-process | Accept for single-user; use external dedupe only for multi-instance |
-| O-05 | Low | Qoder token usage is zero | Source limitation; collect credits later if useful |
+| O-05 | Low | Qoder token usage is zero | Source limitation; Qoder currently reports zero tokens |
 | O-06 | Low | `FileChanged` has no matcher | Add a matcher if that event is needed |
 | O-07 | Low | No OTLP/gRPC or Protobuf | Not needed for local OTLP/HTTP |
 | O-08 | Low | Jaeger memory storage | Restarting Jaeger loses traces |
 
-## 8. Verification
+## 9. Verification
 
 ```bash
 cd /Users/simon/dev/claude-hooks-collector
@@ -175,7 +194,7 @@ python3 simulate.py
 curl http://127.0.0.1:4321/health
 ```
 
-## 9. Conclusion
+## 10. Conclusion
 
 The project is appropriately sized for a local single-user tool: one collector
 process, one backend, in-memory state, and OTLP/HTTP delivery. The code is split

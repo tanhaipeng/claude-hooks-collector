@@ -8,6 +8,7 @@ pub struct Config {
     pub(crate) otlp_headers: HeaderMap,
     pub(crate) otlp_headers_configured: bool,
     pub(crate) langfuse: bool,
+    pub(crate) service_name: String,
     pub(crate) queue_capacity: usize,
     pub(crate) ttl_seconds: u64,
     pub(crate) ttl_sweep_seconds: u64,
@@ -21,6 +22,8 @@ impl Config {
         );
         let otlp_headers = parse_otlp_headers(&env::var("OTLP_HEADERS").unwrap_or_default());
         let otlp_headers_configured = !otlp_headers.is_empty();
+        let service_name =
+            env::var("SERVICE_NAME").unwrap_or_else(|_| "claude-code-hooks".to_string());
         let backend = env::var("OTEL_BACKEND")
             .unwrap_or_default()
             .to_ascii_lowercase();
@@ -53,6 +56,7 @@ impl Config {
             otlp_headers,
             otlp_headers_configured,
             langfuse,
+            service_name,
             queue_capacity,
             ttl_seconds,
             ttl_sweep_seconds,

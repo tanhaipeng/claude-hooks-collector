@@ -98,7 +98,7 @@ Jaeger :4318
 cargo test
 ```
 
-当前有 10 个测试，覆盖 config、util、attributes、transcript 增量解析、token 去重。
+当前有 12 个测试，覆盖 config、util、attributes、transcript 增量解析、token 去重、Qoder request_set_id、客户端标记。
 
 ## OTel 资源命名
 
@@ -111,7 +111,8 @@ cargo test
 | `telemetry.sdk.language` | `rust` |
 | `telemetry.source` | `hooks` |
 
-`service.name` 表示“Claude Code Hook 遥测的生产者”，不是 Claude Code 本体。
+`service.name` 表示“Hook 遥测的生产者”，不是 Claude Code 本体。可通过
+`SERVICE_NAME` 覆盖；Qoder 单独实例可设为 `qoder-cli`。
 
 ## 配置
 
@@ -137,6 +138,7 @@ LANGFUSE_AUTH=<base64(pk:sk)>
 | `OTLP_ENDPOINT` | `http://127.0.0.1:4318` | 自动补 `/v1/traces`；支持 http/https |
 | `OTLP_HEADERS` | 空 | `key=value,key=value`，用于 Langfuse Basic Auth 等 |
 | `OTEL_BACKEND` | 自动 | `langfuse` / `jaeger` / `generic`；留空按 endpoint 自动判断 |
+| `SERVICE_NAME` | `claude-code-hooks` | OTel `service.name`；单独跑 Qoder 实例时可设为 `qoder-cli` |
 | `QUEUE_CAPACITY` | `4096` | 有界队列；满了丢 span 并计数 |
 | `SESSION_TTL_SECS` | `3600` | 无活动 session 清理时间；0 禁用 |
 | `TTL_SWEEP_SECS` | `60` | TTL 扫描间隔 |
@@ -226,7 +228,7 @@ Jaeger 模式（默认 `http://127.0.0.1:4318`）不会写这些字段。
 
 - 如果只设置 Langfuse endpoint 但使用非标准 host/port，显式设置
   `OTEL_BACKEND=langfuse` 更可靠
-- Qoder 没有 `prompt_id`，当前 per-turn token 仍可能为空
+- Qoder 使用 `request_set_id` fallback；turn token job 会创建，但 Qoder 当前返回 0
 
 如果 UI 报 **Project Not Found**：
 
@@ -375,7 +377,7 @@ Qoder 配置：`~/.qoder/settings.json`
 
 实测 Qoder 会话 trace：
 
-<http://127.0.0.1:16686/trace/75ca997301d9cfd6cf5dbd86b9da01de>
+<http://127.0.0.1:16686/trace/b802f639c251be1cef578b4616cf9c02>
 
 包含：
 
@@ -392,11 +394,14 @@ session.summary
 ### Qoder 兼容性限制
 
 - Qoder 的 `UserPromptSubmit` 使用 `request_set_id`，没有 Claude 的 `prompt_id`
-  - 当前 collector 会生成 turn/tool span
-  - 但不会创建 per-turn token job，`agent.turn` 没有 token
+  - collector 现在会用 `request_set_id` / `parent_request_set_id` 作为 turn ID 和 token job 的 fallback
+  - turn/tool span 正常
+  - per-turn token job 会创建，但 Qoder 当前返回的 token 仍为 0
 - Qoder transcript 的 `usage` 目前为 0（Qwen3.8-Flash），所以 `session.summary` token 也是 0
-- Qoder 与 Claude Code 共用 `service.name=claude-code-hooks`，trace 会混在同一个 service 下
-  - 需要严格隔离时，建议给 Qoder 单独运行一个 collector 实例，或后续增加 `SERVICE_NAME`/`CLIENT=qoder`
+  - 这是 Qoder 数据源限制，不是 collector 丢失
+- Qoder 与 Claude Code 默认共用 `service.name=claude-code-hooks`
+  - 需要严格隔离时，给 Qoder 单独跑一个 collector 实例并设置 `SERVICE_NAME=qoder-cli`
+  - span 上有 `claude.client=qoder` 可用于过滤
 - Qoder 的 `WorktreeCreate` / `WorktreeRemove` 未配置，原因与 Claude 相同：特殊失败契约可能影响 worktree 流程
 
 ## 事件映射
@@ -478,6 +483,9 @@ claude.hook.payload          # 完整原始 JSON
 claude.hook.payload_bytes
 claude.session_id
 claude.prompt_id
+claude.request_set_id
+claude.parent_request_set_id
+claude.client
 claude.cwd
 claude.permission_mode
 claude.tool_name / claude.tool_use_id

@@ -45,7 +45,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "service": "claude-hooks-collector",
-        "otel_service_name": "claude-code-hooks",
+        "otel_service_name": state.inner.service_name,
         "otel_service_namespace": "claude-code",
         "otlp_endpoint": state.inner.otlp_endpoint,
         "otlp_headers_configured": state.inner.otlp_headers_configured,

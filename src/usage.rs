@@ -112,6 +112,20 @@ fn walk_usage(value: &Value, usage: &mut UsageStats) {
     }
 }
 
+fn prompt_id_matches(value: &Value, prompt_id: &str) -> bool {
+    ["promptId", "prompt_id", "requestSetId", "request_set_id"]
+        .into_iter()
+        .any(|key| value.get(key).and_then(Value::as_str) == Some(prompt_id))
+}
+
+fn has_other_prompt(value: &Value, prompt_id: &str) -> bool {
+    let ids = ["promptId", "prompt_id", "requestSetId", "request_set_id"]
+        .into_iter()
+        .filter_map(|key| value.get(key).and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    !ids.is_empty() && !ids.iter().any(|candidate| *candidate == prompt_id)
+}
+
 fn parse_turn_usage(path: &str, prompt_id: &str, start_offset: u64) -> (UsageStats, u64) {
     let mut usage = UsageStats::default();
     let Ok(file) = File::open(path) else {
@@ -151,21 +165,15 @@ fn parse_turn_usage(path: &str, prompt_id: &str, start_offset: u64) -> (UsageSta
             continue;
         };
         let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let line_prompt = value
-            .get("promptId")
-            .or_else(|| value.get("prompt_id"))
-            .and_then(Value::as_str);
 
         if line_type == "user" {
-            if let Some(line_prompt) = line_prompt {
-                if active && line_prompt != prompt_id {
-                    end_offset = before;
-                    break;
-                }
-                if line_prompt == prompt_id {
-                    active = true;
-                    saw_prompt = true;
-                }
+            if active && has_other_prompt(&value, prompt_id) {
+                end_offset = before;
+                break;
+            }
+            if prompt_id_matches(&value, prompt_id) {
+                active = true;
+                saw_prompt = true;
             }
             end_offset = after;
             continue;
@@ -219,6 +227,19 @@ fn build_summary_span(job: &SummaryJob, usage: &UsageStats, langfuse: bool) -> S
             "SessionSummary".to_string(),
         ),
         ("claude.session_id".to_string(), job.session_id.clone()),
+        (
+            "claude.client".to_string(),
+            if job
+                .transcript_path
+                .as_deref()
+                .is_some_and(|path| path.contains("/.qoder/"))
+            {
+                "qoder"
+            } else {
+                "claude-code"
+            }
+            .to_string(),
+        ),
         (
             "claude.session.duration_ms".to_string(),
             duration_ms.to_string(),
@@ -454,6 +475,37 @@ mod tests {
 
         let usage = parse_usage(Some(path.to_str().unwrap()));
         assert_eq!((usage.input_tokens, usage.output_tokens), (10, 20));
+
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod qoder_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn parses_qoder_request_set() {
+        let path = std::env::temp_dir().join(format!(
+            "claude-hooks-qoder-usage-{}",
+            crate::util::now_ns()
+        ));
+        let content = [
+            r#"{"type":"user","promptId":"session-1","requestSetId":"req-1"}"#,
+            r#"{"type":"assistant","message":{"id":"m1","model":"qfmodel","usage":{"input_tokens":10,"output_tokens":20}}}"#,
+            r#"{"type":"user","promptId":"session-1","requestSetId":"req-2"}"#,
+            r#"{"type":"assistant","message":{"id":"m2","model":"qfmodel","usage":{"input_tokens":5,"output_tokens":7}}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, content).unwrap();
+
+        let (first, offset) = parse_turn_usage(path.to_str().unwrap(), "req-1", 0);
+        assert_eq!((first.input_tokens, first.output_tokens), (10, 20));
+
+        let (second, _) = parse_turn_usage(path.to_str().unwrap(), "req-2", offset);
+        assert_eq!((second.input_tokens, second.output_tokens), (5, 7));
 
         let _ = fs::remove_file(path);
     }

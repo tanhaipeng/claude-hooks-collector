@@ -32,6 +32,8 @@ pub(crate) fn base_attributes(
 
     for (key, attr) in [
         ("prompt_id", "claude.prompt_id"),
+        ("request_set_id", "claude.request_set_id"),
+        ("parent_request_set_id", "claude.parent_request_set_id"),
         ("turn_id", "claude.turn_id"),
         ("cwd", "claude.cwd"),
         ("permission_mode", "claude.permission_mode"),
@@ -58,6 +60,15 @@ pub(crate) fn base_attributes(
     if let Some(prompt) = payload.get("prompt").and_then(Value::as_str) {
         attributes.push(("claude.prompt_length".to_string(), prompt.len().to_string()));
     }
+
+    let transcript_path = string_field(payload, "transcript_path").unwrap_or_default();
+    let is_qoder = transcript_path.contains("/.qoder/")
+        || payload.get("parent_business_info").is_some()
+        || payload.get("request_set_id").is_some();
+    attributes.push((
+        "claude.client".to_string(),
+        if is_qoder { "qoder" } else { "claude-code" }.to_string(),
+    ));
 
     if langfuse {
         add_langfuse_attributes(&mut attributes, payload, event, session_id);
@@ -320,13 +331,13 @@ pub(crate) fn span_to_otel(span: &SpanDraft) -> Value {
     otel_span
 }
 
-pub(crate) fn otlp_body(spans: &[SpanDraft]) -> Value {
+pub(crate) fn otlp_body(spans: &[SpanDraft], service_name: &str) -> Value {
     let otel_spans: Vec<Value> = spans.iter().map(span_to_otel).collect();
     json!({
         "resourceSpans": [{
             "resource": {
                 "attributes": [
-                    {"key": "service.name", "value": {"stringValue": "claude-code-hooks"}},
+                    {"key": "service.name", "value": {"stringValue": service_name}},
                     {"key": "service.namespace", "value": {"stringValue": "claude-code"}},
                     {"key": "service.version", "value": {"stringValue": env!("CARGO_PKG_VERSION")}},
                     {"key": "telemetry.sdk.name", "value": {"stringValue": "claude-hooks-collector"}},
@@ -375,6 +386,48 @@ mod tests {
         assert_eq!(
             deduped,
             vec![("claude.message.id".to_string(), "two".to_string())]
+        );
+    }
+}
+
+#[cfg(test)]
+mod qoder_tests {
+    use super::*;
+
+    #[test]
+    fn marks_qoder_client_and_optional_langfuse_fields() {
+        let payload = json!({
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "transcript_path": "/Users/simon/.qoder/projects/x/y.jsonl",
+            "request_set_id": "req-1",
+            "prompt": "hello"
+        });
+        let raw = payload.to_string();
+
+        let jaeger = base_attributes(&payload, &raw, "UserPromptSubmit", "s1", false);
+        assert!(
+            jaeger
+                .iter()
+                .any(|(k, v)| k == "claude.client" && v == "qoder")
+        );
+        assert!(
+            jaeger
+                .iter()
+                .any(|(k, v)| k == "claude.request_set_id" && v == "req-1")
+        );
+        assert!(!jaeger.iter().any(|(k, _)| k.starts_with("langfuse.")));
+
+        let langfuse = base_attributes(&payload, &raw, "UserPromptSubmit", "s1", true);
+        assert!(
+            langfuse
+                .iter()
+                .any(|(k, _)| k == "langfuse.observation.type")
+        );
+        assert!(
+            langfuse
+                .iter()
+                .any(|(k, v)| k == "langfuse.observation.input" && v.contains("hello"))
         );
     }
 }

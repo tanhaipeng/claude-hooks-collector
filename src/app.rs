@@ -25,6 +25,7 @@ pub(crate) struct Inner {
     pub(crate) otlp_endpoint: String,
     pub(crate) otlp_headers_configured: bool,
     pub(crate) langfuse: bool,
+    pub(crate) service_name: String,
     pub(crate) recent_events: Mutex<HashMap<String, u64>>,
     pub(crate) dropped_total: AtomicU64,
 }
@@ -41,12 +42,18 @@ pub async fn run(config: Config) -> Result<(), Box<dyn Error>> {
             otlp_endpoint: config.otlp_endpoint.clone(),
             otlp_headers_configured: config.otlp_headers_configured,
             langfuse: config.langfuse,
+            service_name: config.service_name.clone(),
             recent_events: Mutex::new(HashMap::new()),
             dropped_total: AtomicU64::new(0),
         }),
     });
 
-    let exporter = tokio::spawn(exporter_worker(rx, client, config.otlp_endpoint.clone()));
+    let exporter = tokio::spawn(exporter_worker(
+        rx,
+        client,
+        config.otlp_endpoint.clone(),
+        config.service_name.clone(),
+    ));
     let ttl = if config.ttl_seconds > 0 {
         Some(spawn_ttl(
             state.clone(),

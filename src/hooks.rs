@@ -258,6 +258,7 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
             pairs: HashMap::new(),
             messages: HashMap::new(),
             turn_prompt: None,
+            turn_prompt_id: None,
             usage_offset: 0,
             start_ns: now,
             last_seen_ns: now,
@@ -319,9 +320,13 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 .get("prompt")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
-            let turn_id = string_field(payload, "prompt_id")
+            let turn_prompt_id = string_field(payload, "prompt_id")
+                .or_else(|| string_field(payload, "request_set_id"));
+            let turn_id = turn_prompt_id
+                .as_ref()
                 .map(|prompt_id| hex_id(&format!("turn:{}:{prompt_id}", session.root_id), 8))
                 .unwrap_or_else(|| unique_span_id("turn"));
+            session.turn_prompt_id = turn_prompt_id;
             session.turn_id = Some(turn_id.clone());
             session.turn_start_ns = Some(now);
             spans.push(SpanDraft {
@@ -375,7 +380,11 @@ pub(crate) fn handle_event(state: &AppState, payload: &Value) -> EventOutput {
                 error: event == "StopFailure",
             };
             let transcript_path = string_field(payload, "transcript_path");
-            let prompt_id = string_field(payload, "prompt_id");
+            let prompt_id = string_field(payload, "prompt_id")
+                .or_else(|| string_field(payload, "parent_request_set_id"))
+                .or_else(|| string_field(payload, "request_set_id"))
+                .or_else(|| session.turn_prompt_id.take());
+            session.turn_prompt_id = None;
             let start_offset = session.usage_offset;
             if let Some(path) = &transcript_path {
                 if let Ok(metadata) = std::fs::metadata(path) {

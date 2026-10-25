@@ -24,12 +24,17 @@ async fn export_batch(
     Ok(())
 }
 
-async fn flush_batch(client: &reqwest::Client, endpoint: &str, spans: &[SpanDraft]) {
+async fn flush_batch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    service_name: &str,
+    spans: &[SpanDraft],
+) {
     if spans.is_empty() {
         return;
     }
 
-    let body = otlp_body(spans);
+    let body = otlp_body(spans, service_name);
     for attempt in 1..=3 {
         match export_batch(client, endpoint, &body).await {
             Ok(()) => return,
@@ -55,6 +60,7 @@ pub(crate) async fn exporter_worker(
     mut rx: mpsc::Receiver<SpanDraft>,
     client: reqwest::Client,
     endpoint: String,
+    service_name: String,
 ) {
     let mut batch = Vec::with_capacity(64);
     let mut ticker = interval(Duration::from_millis(250));
@@ -67,13 +73,13 @@ pub(crate) async fn exporter_worker(
                     Some(span) => {
                         batch.push(span);
                         if batch.len() >= 64 {
-                            flush_batch(&client, &endpoint, &batch).await;
+                            flush_batch(&client, &endpoint, &service_name, &batch).await;
                             batch.clear();
                         }
                     }
                     None => {
                         if !batch.is_empty() {
-                            flush_batch(&client, &endpoint, &batch).await;
+                            flush_batch(&client, &endpoint, &service_name, &batch).await;
                         }
                         break;
                     }
@@ -81,7 +87,7 @@ pub(crate) async fn exporter_worker(
             }
             _ = ticker.tick() => {
                 if !batch.is_empty() {
-                    flush_batch(&client, &endpoint, &batch).await;
+                    flush_batch(&client, &endpoint, &service_name, &batch).await;
                     batch.clear();
                 }
             }
