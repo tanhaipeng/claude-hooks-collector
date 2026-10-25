@@ -321,6 +321,44 @@ Claude Code 的 `SessionStart` 只支持 `type: "command"` 和 `type: "mcp_tool"
 实测 collector 停止时，`claude -p` 仍以 exit 0 完成；输出可能出现一条
 `hook ... failed` 提示，但不会中断 prompt 或工具调用。
 
+## Qoder CLI 接入
+
+本机 Qoder CLI `1.1.78` 已验证可以直接把 Hooks 发到当前 collector。
+
+Qoder 配置：`~/.qoder/settings.json`
+
+- 除 `WorktreeCreate` / `WorktreeRemove` 外，Qoder 文档中的 25 个事件已配置
+- `SessionStart` 使用 `command + curl` 转发到 `4321`
+- 其余事件使用 Qoder 原生 `type: "http"` 指向 `http://127.0.0.1:4321/hooks`
+- Hook `timeout` 为 2 秒
+- 旧 `qoder-otel-bridge`（4320）不再是 Qoder 的接收端
+
+实测 Qoder 会话 trace：
+
+<http://127.0.0.1:16686/trace/75ca997301d9cfd6cf5dbd86b9da01de>
+
+包含：
+
+```text
+session
+prompt
+tool.Read
+tool.Read.result
+agent.turn
+session.end
+session.summary
+```
+
+### Qoder 兼容性限制
+
+- Qoder 的 `UserPromptSubmit` 使用 `request_set_id`，没有 Claude 的 `prompt_id`
+  - 当前 collector 会生成 turn/tool span
+  - 但不会创建 per-turn token job，`agent.turn` 没有 token
+- Qoder transcript 的 `usage` 目前为 0（Qwen3.8-Flash），所以 `session.summary` token 也是 0
+- Qoder 与 Claude Code 共用 `service.name=claude-code-hooks`，trace 会混在同一个 service 下
+  - 需要严格隔离时，建议给 Qoder 单独运行一个 collector 实例，或后续增加 `SERVICE_NAME`/`CLIENT=qoder`
+- Qoder 的 `WorktreeCreate` / `WorktreeRemove` 未配置，原因与 Claude 相同：特殊失败契约可能影响 worktree 流程
+
 ## 事件映射
 
 | Claude Hook 事件 | 生成的 span | 说明 |
