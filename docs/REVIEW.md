@@ -45,6 +45,7 @@ Checks:
 ```text
 cargo check                         PASS
 cargo build                         PASS
+cargo test                          10 passed
 python3 simulate.py                 PASS, 35 spans
 cargo clippy --all-targets          PASS with ~11 warnings (no errors)
 ```
@@ -109,6 +110,7 @@ Tradeoffs:
 | F-08 | Medium | Duplicate OTel attributes and string-typed numeric fields | Dedupe attributes; int/bool value export | Raw OTLP/Jaeger checks clean |
 | F-09 | Medium | `agent.turn`/`session.summary` had no Langfuse usage model | `GENERATION`, model, usage details, `chat` operation | Langfuse events show input/output/total token maps |
 | F-10 | Medium | SessionEnd/TTL could orphan active turn | Emit `agent.turn.incomplete` | SessionEnd/TTL tests include incomplete span |
+| F-11 | Medium | All logic lived in `main.rs` | Split into `config/app/http/hooks/spans/exporter/spool/usage/state/util` modules; `main.rs` is boot-only | Module tests: 10 passed |
 
 ### Open findings
 
@@ -119,7 +121,7 @@ Tradeoffs:
 | O-03 | Medium | Only one backend; no Jaeger + Langfuse dual-write | Implement multi-target fan-out or put an OTel Collector in front |
 | O-04 | Medium | Transcript parser assumes `promptId`, `message.id`, `usage` schema | Add schema-version detection, `usage.available` flag, fixture tests |
 | O-05 | Medium | Spool has no size/age cap; 5xx replay can block a batch | Add max file count/bytes/age and bounded replay backoff |
-| O-06 | Medium | No Rust unit/integration tests or CI | Add mock OTLP tests for events, dedupe, tokens, TTL, spool, SIGTERM |
+| O-06 | Low | No CI or mock OTLP integration suite (10 module unit tests exist) | Add CI + mock OTLP tests for events/TTL/SIGTERM |
 | O-07 | Low | Late/out-of-order `MessageDisplay final` can create a second span | Track completed `message_id`s; ignore late finals |
 | O-08 | Low | `FileChanged` has no matcher in `claude-hooks.json` | Add e.g. `"matcher": ".envrc|.env"` if the event is needed |
 | O-09 | Low | No OTLP/gRPC or protobuf support | Add optional gRPC/protobuf transport if performance matters |
@@ -140,7 +142,7 @@ Tradeoffs:
 
 ### P1 — reliability and maintainability
 
-1. Rust unit tests + CI (`cargo fmt`, `clippy`, `test`)
+1. CI + mock OTLP integration tests (`cargo fmt`, `clippy`, `test`)
 2. Mock OTLP integration tests for token/dedupe/spool/SIGTERM
 3. Multi-target fan-out if both Langfuse and Jaeger are required
 4. Improve transcript schema handling and sidechain token semantics
@@ -193,6 +195,6 @@ full payload capture, token accounting, backend switching, and fail-open Hook
 behavior are implemented and verified.
 
 The biggest remaining improvement is not a missing feature but **operational
-trust**: readiness/metrics, tests/CI, and localhost-only exposure. Those are the
+trust**: readiness/metrics, CI/integration tests, and localhost-only exposure. Those are the
 next items to address before treating the collector as a long-running shared
 service.

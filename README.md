@@ -73,6 +73,33 @@ Jaeger :4318
 
 一次只发一个后端，不做双写。切换后端只需要改 `collector.env` 并重启 collector。
 
+## 工程结构
+
+`main.rs` 现在只负责 tracing 初始化和启动，业务逻辑按职责拆分：
+
+| 文件 | 职责 |
+|---|---|
+| `src/main.rs` | 进程入口，只调用 `app::run` |
+| `src/lib.rs` | 模块导出 |
+| `src/config.rs` | `collector.env`/环境变量解析、OTLP header、endpoint |
+| `src/app.rs` | AppState、启动、exporter/replay/TTL task、优雅退出 |
+| `src/http.rs` | Axum 路由、`/hooks`、`/health` |
+| `src/hooks.rs` | Hook 事件分发、session/turn/tool 状态机、span 组装、TTL 清理 |
+| `src/state.rs` | `SessionState`、pair、MessageStream 状态类型 |
+| `src/spans.rs` | SpanDraft、Claude/GenAI/Langfuse 属性、OTLP JSON 转换 |
+| `src/exporter.rs` | 队列 worker、批量、重试 |
+| `src/spool.rs` | spool 权限、原子写入、启动/定时重放 |
+| `src/usage.rs` | transcript token 增量解析、turn/session token job |
+| `src/util.rs` | ID、时间、字段提取等纯工具 |
+
+单元测试直接放在模块内：
+
+```bash
+cargo test
+```
+
+当前有 10 个测试，覆盖 config、util、attributes、transcript 增量解析、token 去重、spool 权限。
+
 ## OTel 资源命名
 
 | 属性 | 值 |
@@ -566,7 +593,7 @@ Jaeger 当前示例 trace：
 - **Jaeger memory storage**：重启丢 trace
 - **一轮一个 turn**：同 session 当前只维护一个 active turn；Claude 正常串行
 - **transcript schema**：依赖 Claude JSONL 的 `promptId` / `message.id` / `usage` 字段，Claude 改格式时需要适配
-- **无 metrics/CI**：健康检查只有 liveness，没有 Prometheus metrics；Rust 单测和 CI 尚未补齐
+- **CI/metrics 未完成**：已有 10 个 Rust 单测，但还没有 CI 和 Prometheus metrics
 
 ## 排查
 
@@ -611,7 +638,7 @@ cp collector.env.langfuse collector.env
 1. Langfuse/MinIO 端口绑定 127.0.0.1
 2. health 增加后端可达性、spool 数量、last export error
 3. 单后端 → 多后端双写
-4. Rust 单测 + CI
+4. CI + mock OTLP 集成测试
 5. 支持 OTLP/gRPC / Protobuf
 6. FileChanged matcher
 7. 更精确的工具耗时（transcript 时间戳）
