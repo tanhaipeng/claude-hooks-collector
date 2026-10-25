@@ -239,8 +239,10 @@ fn base_attributes(payload: &Value, event: &str, session_id: &str) -> Vec<(Strin
                 attributes.push(("gen_ai.tool.call.id".to_string(), tool_use_id.clone()));
             }
         }
-        "UserPromptSubmit" | "Stop" | "StopFailure" | "SubagentStart" | "SubagentStop"
-        | "SessionStart" | "SessionEnd" => {
+        "Stop" | "StopFailure" => {
+            attributes.push(("gen_ai.operation.name".to_string(), "chat".to_string()));
+        }
+        "UserPromptSubmit" | "SubagentStart" | "SubagentStop" | "SessionStart" | "SessionEnd" => {
             attributes.push((
                 "gen_ai.operation.name".to_string(),
                 "invoke_agent".to_string(),
@@ -1493,10 +1495,7 @@ fn build_summary_span(job: &SummaryJob, usage: &UsageStats) -> SpanDraft {
             "claude.subagent_count".to_string(),
             job.subagent_count.to_string(),
         ),
-        (
-            "gen_ai.operation.name".to_string(),
-            "invoke_agent".to_string(),
-        ),
+        ("gen_ai.operation.name".to_string(), "chat".to_string()),
         ("gen_ai.conversation.id".to_string(), job.session_id.clone()),
         (
             "gen_ai.usage.input_tokens".to_string(),

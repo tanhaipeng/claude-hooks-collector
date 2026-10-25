@@ -151,6 +151,10 @@ python3 simulate.py
 `simulate.py` 会检测 collector 的 OTLP endpoint；如果指向 Langfuse，
 会查询 `GET /api/public/v2/observations` 并确认 35 个 observation 已到达。
 
+`agent.turn` / `session.summary` 会映射为 Langfuse 的 `GENERATION`，
+`usage_details` 包含 `input` / `output` / `total` / cache token，模型名写入
+`langfuse.observation.model.name`。
+
 当前不再向 Jaeger 双写：旧 Jaeger trace 保留，新 trace 只发 Langfuse。
 如果要切换回 Jaeger，修改 `collector.env` 的 `OTLP_ENDPOINT` 并重启 collector。
 
