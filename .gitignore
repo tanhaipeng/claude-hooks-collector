@@ -1,5 +1,5 @@
 /target
-collector.log
+*.log
 collector.pid
 .idea/
 collector.env
